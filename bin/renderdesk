@@ -1,0 +1,68 @@
+#!/usr/bin/env python3
+"""render-desk: drop a .blend in Drive, get a finished mp4 back."""
+import argparse
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+from renderdesk import config, providers, watch  # noqa: E402
+
+
+def main():
+    ap = argparse.ArgumentParser(prog="renderdesk")
+    sub = ap.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("watch", help="watch the drop folder forever (what launchd runs)")
+    sub.add_parser("once", help="handle whatever is in the drop folder, then exit")
+    sub.add_parser("doctor", help="check the setup without rendering anything")
+    cost = sub.add_parser("cost", help="what rendering has actually cost, and the monthly projection")
+    cost.add_argument("--clips", type=int, default=25)
+    cost.add_argument("--seconds", type=int, default=35)
+    cost.add_argument("--fps", type=int, default=30)
+    render = sub.add_parser("render", help="render one file directly, bypassing the folders")
+    render.add_argument("blend")
+    render.add_argument("--provider", default="")
+    args = ap.parse_args()
+
+    cfg = config.load()
+    if args.cmd == "doctor":
+        return watch.doctor(cfg)
+    if args.cmd == "cost":
+        from renderdesk import ledger
+
+        out = ledger.summary(cfg, args.clips, args.seconds, args.fps)
+        if not out:
+            print("Nothing measured yet. Render one real clip on the GPU and this will")
+            print("tell you the monthly bill for your whole batch.")
+            return 0
+        print(f"  measured over {out['jobs']} GPU job(s), {out['frames']} frames")
+        print(f"  {out['seconds_per_frame']} seconds per frame")
+        print(f"  ${out['usd_per_frame']:.5f} per frame")
+        print(f"  ${out['usd_so_far']:.2f} spent so far")
+        print()
+        print(f"  {out['plan']} = {out['planned_frames']} frames")
+        print(f"  projected: ${out['projected_usd']:.2f} per month")
+        return 0
+    if args.cmd == "watch":
+        watch.loop(cfg)
+        return 0
+    if args.cmd == "once":
+        watch.loop(cfg, once=True)
+        return 0
+    if args.cmd == "render":
+        if args.provider:
+            cfg["PROVIDER"] = args.provider
+        dirs = watch.ensure_folders(cfg)
+        source = Path(args.blend).resolve()
+        staged = dirs[0] / source.name
+        if staged != source:
+            import shutil
+
+            shutil.copy2(source, staged)
+        watch.run_one(staged, cfg, dirs, providers.get(cfg["PROVIDER"], cfg))
+        return 0
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())
