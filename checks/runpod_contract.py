@@ -76,6 +76,8 @@ check("v2 body: ssh is requested and port 22 exposed",
       body.get("startSsh") is True and "22/tcp" in body.get("ports", []))
 check("v2 body: the public key is sent so scp can connect",
       body.get("env", {}).get("PUBLIC_KEY", "").startswith("ssh-"))
+check("v2 body: both key env names are sent, since images differ",
+      body.get("env", {}).get("SSH_PUBLIC_KEY") == body.get("env", {}).get("PUBLIC_KEY"))
 check("pod name is tagged so orphans can be found later",
       body["name"].startswith("renderdesk-"))
 

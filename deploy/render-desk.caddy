@@ -1,0 +1,28 @@
+# NOT INSTALLED until Nick says so and the DNS exists. This Caddy also serves client
+# sites, so: copy to /etc/caddy/studio/render-desk.caddy (already imported by the
+# Caddyfile), then `caddy validate --config /etc/caddy/Caddyfile` and only then
+# `systemctl reload caddy`. A reload keeps the old config if the new one is bad.
+#
+# Needs an A record for HOSTNAME -> 46.62.230.121 first, or Caddy cannot get a
+# certificate and will retry noisily.
+HOSTNAME {
+	encode zstd gzip
+	header {
+		Strict-Transport-Security "max-age=31536000"
+		X-Content-Type-Options "nosniff"
+		X-Frame-Options "DENY"
+		Referrer-Policy "no-referrer"
+		X-Robots-Tag "noindex, nofollow"
+	}
+	# Scene files are large and renders are long: no buffering, no early timeout.
+	request_body {
+		max_size 4GB
+	}
+	reverse_proxy 127.0.0.1:8630 {
+		flush_interval -1
+		transport http {
+			read_timeout 30m
+			write_timeout 30m
+		}
+	}
+}

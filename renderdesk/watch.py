@@ -120,8 +120,13 @@ def loop(cfg, once=False):
 def doctor(cfg):
     inbox, working, finished, problems = ensure_folders(cfg)
     rows = []
-    rows.append(("blender", shutil.which(cfg["BLENDER"]) or "MISSING", cfg["BLENDER"]))
-    rows.append(("ffmpeg", shutil.which(cfg.get("FFMPEG", "ffmpeg")) or "MISSING", ""))
+    local = cfg["PROVIDER"] == "local"
+    blender = shutil.which(cfg["BLENDER"])
+    rows.append(("blender", (blender or "MISSING") if local
+                 else (blender or "not needed here, the GPU inspects the scene"),
+                 cfg["BLENDER"]))
+    if cfg["PROVIDER"] == "local":
+        rows.append(("ffmpeg", shutil.which(cfg.get("FFMPEG", "ffmpeg")) or "MISSING", ""))
     rows.append(("drop folder", "ok" if inbox.exists() else "MISSING", str(inbox)))
     rows.append(("provider", cfg["PROVIDER"], ""))
     day_left, month_left = budget_left(cfg)

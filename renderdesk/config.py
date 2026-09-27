@@ -3,7 +3,12 @@ import os
 import shlex
 from pathlib import Path
 
-ENV_PATH = Path.home() / ".config" / "render-desk" / "render.env"
+# On a Mac the config is the user's. On the box it is the service's, in /etc.
+ENV_CANDIDATES = (
+    Path.home() / ".config" / "render-desk" / "render.env",
+    Path("/etc/render-desk/render.env"),
+)
+ENV_PATH = next((p for p in ENV_CANDIDATES if p.exists()), ENV_CANDIDATES[0])
 
 DRIVE = Path.home() / "Library" / "CloudStorage" / "GoogleDrive-nikolaskoundouros@gmail.com" / "My Drive"
 DESK = DRIVE / "Nick-AE" / "render"
@@ -51,8 +56,13 @@ def _parse(text):
 
 def load():
     cfg = dict(DEFAULTS)
-    if ENV_PATH.exists():
-        cfg.update(_parse(ENV_PATH.read_text()))
+    for path in ENV_CANDIDATES:
+        if path.exists():
+            try:
+                cfg.update(_parse(path.read_text()))
+            except PermissionError:
+                pass
+            break
     for key in cfg:
         if os.environ.get(key):
             cfg[key] = os.environ[key]

@@ -1,0 +1,29 @@
+[Unit]
+Description=Render Desk, the editor's render page
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=renderdesk
+Group=renderdesk
+WorkingDirectory=/opt/render-desk
+EnvironmentFile=/etc/render-desk/render.env
+ExecStart=/usr/bin/python3 -u /opt/render-desk/bin/renderdesk serve
+Restart=always
+RestartSec=5
+
+# This box also serves client sites. Nothing here gets to threaten them.
+MemoryMax=768M
+TasksMax=200
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ProtectKernelTunables=true
+ProtectControlGroups=true
+RestrictSUIDSGID=true
+ReadWritePaths=/var/lib/render-desk
+
+[Install]
+WantedBy=multi-user.target

@@ -85,6 +85,7 @@ class RunPodProvider:
 
     def _create(self, job_name, log):
         wanted = [g.strip() for g in self.cfg["GPU_PREFERENCE"].split(",") if g.strip()]
+        public = Path(str(self.key) + ".pub").read_text().strip()
         cap = float(self.cfg["GPU_MAX_USD_PER_HOUR"])
         errors = []
         for gpu_id in wanted:
@@ -96,7 +97,10 @@ class RunPodProvider:
                 "disk": 20,
                 "ports": ["22/tcp"],
                 "startSsh": True,
-                "env": {"PUBLIC_KEY": Path(str(self.key) + ".pub").read_text().strip()},
+                # RunPod's docs name both PUBLIC_KEY and SSH_PUBLIC_KEY depending on the
+                # image. Sending both costs nothing and avoids finding out which on a
+                # pod that is already billing.
+                "env": {"PUBLIC_KEY": public, "SSH_PUBLIC_KEY": public},
                 "mounts": {"network": [{"volumeId": self.cfg["RUNPOD_VOLUME_ID"],
                                         "path": "/workspace"}]},
             }
