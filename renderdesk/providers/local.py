@@ -22,7 +22,7 @@ class LocalProvider:
             return "METAL"
         return "NONE"
 
-    def render(self, blend, frames_dir, opts, log):
+    def render(self, blend, frames_dir, opts, log, on_scene=None):
         frames_dir.mkdir(parents=True, exist_ok=True)
         cmd = [
             self.cfg["BLENDER"], "-b", str(blend), "--factory-startup", "-noaudio",

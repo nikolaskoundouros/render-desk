@@ -13,7 +13,7 @@ import subprocess
 import time
 from pathlib import Path
 
-from .. import runpod_api
+from .. import preflight, runpod_api
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 POD_PREFIX = "renderdesk-"
@@ -143,7 +143,7 @@ class RunPodProvider:
         raise RuntimeError(f"the machine did not start within {timeout // 60} minutes")
 
     # --- the job -------------------------------------------------------------
-    def render(self, blend, frames_dir, opts, log):
+    def render(self, blend, frames_dir, opts, log, on_scene=None):
         job = frames_dir.name
         remote_job = f"/workspace/jobs/{job}"
         remote_frames = f"/workspace/frames/{job}"
@@ -178,6 +178,24 @@ class RunPodProvider:
             self._run(target, f"bash /workspace/pod_bootstrap.sh {shlex.quote(self.version)}", log)
 
             blender = f"/workspace/blender/{self.version}/blender"
+
+            if on_scene is not None:
+                # Inspect the scene here, on the machine that will render it, before a
+                # single frame is paid for. A file that fails the gate aborts the job
+                # and the pod is destroyed in the finally block below.
+                self._copy(target, SCRIPTS / "preflight_blend.py", "/workspace/preflight.py")
+                report_remote = f"{remote_job}/scene.json"
+                log("RD_SETUP inspecting the scene")
+                self._run(target,
+                          f"{blender} -b {shlex.quote(remote_blend)} --factory-startup -noaudio "
+                          f"--python /workspace/preflight.py -- {shlex.quote(report_remote)}")
+                local_report = frames_dir.parent / f"{job}-scene.json"
+                frames_dir.parent.mkdir(parents=True, exist_ok=True)
+                self._copy(target, local_report, report_remote, up=False)
+                report = json.loads(local_report.read_text())
+                local_report.unlink(missing_ok=True)
+                on_scene(report)
+                opts = dict(opts, fps=report["fps"])
             cmd = (f"{blender} -b {shlex.quote(remote_blend)} --factory-startup -noaudio "
                    f"--python /workspace/render_job.py -- --out {shlex.quote(remote_frames)} "
                    f"--device OPTIX")

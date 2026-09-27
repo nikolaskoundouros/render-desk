@@ -120,16 +120,32 @@ class Job:
         return Path(self.cfg["STATE_DIR"]) / "frames" / key
 
     def check(self):
+        """The checks that cost nothing. Anything needing Blender happens later, on
+        whichever machine is going to do the rendering."""
         self.status("Checking the file.")
         self.unpack_if_zip()
         preflight.check_version(self.blend, self.cfg["BLENDER_VERSION"])
-        report = preflight.gate(preflight.inspect(self.blend, self.cfg["BLENDER"]))
-        self.report = report
         self.frames = self.frames_dir()
         self.frames.mkdir(parents=True, exist_ok=True)
-        self.opts["fps"] = report["fps"]
         unpacked = self.dir / "unpacked"
         self.opts["root"] = str(unpacked) if unpacked.exists() else None
+
+        blender = shutil.which(self.cfg["BLENDER"])
+        if blender:
+            self.accept_scene(preflight.inspect(self.blend, blender))
+        else:
+            # No Blender on this machine, so the render provider inspects the scene
+            # on the machine it rents. Costs a minute of GPU on a file that turns out
+            # to be broken, and keeps a 4 GB box from being asked to open a 2 GB scene.
+            self.status("Queued for rendering.", "Checking the scene on the render machine.")
+        return self.report
+
+    def accept_scene(self, report):
+        """Gate a scene report, wherever it was produced, and tell the editor what
+        is about to be rendered."""
+        preflight.gate(report)
+        self.report = report
+        self.opts["fps"] = report["fps"]
         (self.dir / "scene-report.json").write_text(json.dumps(report, indent=2))
         width, height = report["resolution"]
         if self.opts["scale"]:
@@ -142,8 +158,10 @@ class Job:
         return report
 
     def render(self, provider):
-        total = self.report["frames"]
         state = {"done": 0, "times": []}
+
+        def total():
+            return self.report["frames"] if self.report else 0
 
         def on_line(line):
             self.log(line)
@@ -156,14 +174,16 @@ class Job:
                 left = ""
                 if state["times"]:
                     per = sum(state["times"]) / len(state["times"])
-                    left = f" {human_time(per * (total - state['done']))} left."
-                self.status("Rendering now.", f"Frame {state['done']} of {total}.{left}")
+                    left = f" {human_time(per * (total() - state['done']))} left."
+                self.status("Rendering now.", f"Frame {state['done']} of {total()}.{left}")
             elif line.startswith("RD_DEVICE"):
                 self.status("Rendering now.", f"Machine: {line[len('RD_DEVICE '):]}")
 
-        self.status("Rendering now.", f"Frame 0 of {total}.")
-        result = provider.render(self.blend, self.frames, self.opts, on_line)
-        self.log(f"RD_RESULT {json.dumps(result)}")
+        result = provider.render(self.blend, self.frames, self.opts, on_line,
+                                 on_scene=self.accept_scene)
+        if self.report is None:
+            raise RuntimeError("the render finished but the scene was never inspected")
+        self.log(f"RD_RESULT {json.dumps(result, default=str)}")
         return result
 
     def deliver(self, result):
