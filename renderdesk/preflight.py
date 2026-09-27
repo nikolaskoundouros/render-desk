@@ -13,6 +13,11 @@ from . import blendfile
 SCRIPT = Path(__file__).parent / "scripts" / "preflight_blend.py"
 
 
+class Busy(RuntimeError):
+    """No render machine was free. Nothing is wrong with the file, so the job waits
+    and tries again instead of being thrown back at the editor."""
+
+
 class Rejected(Exception):
     def __init__(self, message, detail=""):
         super().__init__(message)

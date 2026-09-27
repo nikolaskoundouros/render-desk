@@ -27,8 +27,9 @@ def check(name, condition, detail=""):
 
 
 class FakeClient:
-    def __init__(self, fail_for=(), cost=0.74):
+    def __init__(self, fail_for=(), cost=0.74, fail_with_volume=False):
         self.fail_for = fail_for
+        self.fail_with_volume = fail_with_volume
         self.cost = cost
         self.created = []
         self.terminated = []
@@ -39,6 +40,10 @@ class FakeClient:
         gpu = body["gpu"]["id"]
         if gpu in self.fail_for:
             raise runpod_api.RunPodError(f"HTTP 400: no {gpu} available")
+        if self.fail_with_volume and "mounts" in body:
+            raise runpod_api.RunPodError(
+                "HTTP 400: There are no longer any instances available with the "
+                "requested specifications.")
         return {"id": f"pod-{len(self.created)}", "cost": self.cost,
                 "status": "PROVISIONING", "gpu": {"id": gpu}}
 
@@ -63,7 +68,7 @@ provider = RunPodProvider(cfg)
 
 # --- the request body matches the documented v2 schema ---------------------
 provider.client = FakeClient()
-pod = provider._create("job-1", lambda *_: None)
+pod, on_volume = provider._create("job-1", lambda *_: None)
 body = provider.client.created[0]
 check("v2 body: image at the top level", "image" in body and "imageName" not in body)
 check("v2 body: gpu is nested {id,count}",
@@ -83,9 +88,22 @@ check("pod name is tagged so orphans can be found later",
 
 # --- an unavailable GPU falls back instead of failing the job --------------
 provider.client = FakeClient(fail_for=("NVIDIA GeForce RTX 4090",))
-pod = provider._create("job-2", lambda *_: None)
+pod, _ = provider._create("job-2", lambda *_: None)
 check("falls back to the next GPU when the first is unavailable",
       pod["gpu"]["id"] == "NVIDIA A40", str(pod))
+
+# --- a data centre with no GPUs left must not stop the editor --------------
+# This is not hypothetical: on the first real job EU-RO-1 had nothing free at all.
+empty = RunPodProvider(cfg)
+empty.client = FakeClient(fail_with_volume=True)
+pod, on_volume = empty._create("job-dry", lambda *_: None)
+check("an empty data centre falls back to renting without the volume",
+      pod is not None and on_volume is False, str(on_volume))
+check("the fallback pod asks for no volume and no data centre",
+      "mounts" not in empty.client.created[-1] and "dataCenterIds" not in empty.client.created[-1],
+      str(empty.client.created[-1].keys()))
+check("the first attempt did ask for the volume",
+      "mounts" in empty.client.created[0])
 
 # --- every GPU unavailable is an error, not a silent hang ------------------
 provider.client = FakeClient(fail_for=("NVIDIA GeForce RTX 4090", "NVIDIA A40"))
@@ -94,6 +112,7 @@ try:
     check("no GPU available raises", False, "it did not raise")
 except RuntimeError as exc:
     check("no GPU available raises a readable error", "no GPU could be rented" in str(exc))
+    check("the error repeats what RunPod actually said", "no NVIDIA A40 available" in str(exc))
 
 # --- a pod priced above the cap is destroyed immediately -------------------
 cfg["GPU_MAX_USD_PER_HOUR"] = "0.50"
@@ -105,7 +124,7 @@ try:
 except RuntimeError as exc:
     check("price cap refuses an expensive pod", "over the" in str(exc))
 check("a pod refused on price is terminated, not left running",
-      len(capped.client.terminated) == 2, str(capped.client.terminated))
+      len(capped.client.terminated) >= 2, str(capped.client.terminated))
 
 # --- the pod dies even when the render crashes -----------------------------
 cfg["GPU_MAX_USD_PER_HOUR"] = "1.20"

@@ -88,8 +88,15 @@ def collect(dirs):
         if folder.is_dir():
             items.append({"state": "problem", "name": folder.name,
                           "text": read_text(folder / "WHAT-WENT-WRONG.txt")})
-    waiting = [p.name for p in inbox.iterdir()
-               if p.is_file() and p.suffix.lower() in watch.ACCEPTS] if inbox.exists() else []
+    waiting = []
+    if inbox.exists():
+        for path in sorted(inbox.iterdir()):
+            if not path.is_file() or path.suffix.lower() not in watch.ACCEPTS:
+                continue
+            # A job sent back to the queue leaves its explanation beside it, so the
+            # editor sees "waiting for a machine" rather than a bare filename.
+            note = inbox / f".status-{path.stem}.txt"
+            waiting.append({"name": path.name, "text": read_text(note)})
     items.sort(key=lambda i: i["name"], reverse=True)
     return {"items": items, "waiting": waiting}
 
@@ -201,9 +208,10 @@ async function refresh() {
   if (!data.items.length && !data.waiting.length) {
     jobs.innerHTML = '<p class="empty">Nothing here yet.</p>'; return;
   }
-  jobs.innerHTML = data.waiting.map(n =>
-    `<div class="card working"><div class="row"><b>${esc(n)}</b>
-     <span class="tag">Just uploaded</span></div></div>`).join('')
+  jobs.innerHTML = data.waiting.map(w =>
+    `<div class="card working"><div class="row"><b>${esc(w.name)}</b>
+     <span class="tag">${w.text ? 'Waiting' : 'Just uploaded'}</span></div>
+     ${w.text ? `<pre>${esc(w.text)}</pre>` : ''}</div>`).join('')
   + data.items.map(i => {
     let extra = '';
     if (i.preview) extra += `<img class="prev" src="/file/${encodeURIComponent(i.name)}/${i.preview}" alt="">`;

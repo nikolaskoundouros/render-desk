@@ -1,4 +1,5 @@
 """The broker loop: watch the drop folder, run one job at a time, never leave a GPU up."""
+import json
 import shutil
 import time
 import traceback
@@ -8,7 +9,10 @@ import datetime as dt
 
 from . import config, ledger, providers
 from .job import Job, settled
-from .preflight import Rejected
+from .preflight import Busy, Rejected
+
+# How long a job keeps waiting for a free GPU before the editor is told to try later.
+PATIENCE_HOURS = 3
 
 ACCEPTS = {".blend", ".zip"}
 IGNORE_PREFIXES = (".", "~", "_")
@@ -67,6 +71,22 @@ def budget_left(cfg):
             float(cfg["MONTHLY_SPEND_CAP_USD"]) - month)
 
 
+def waiting_since(cfg, name, reset=False):
+    """When this file first failed to find a GPU, so patience can run out."""
+    path = Path(cfg["STATE_DIR"]) / "waiting.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        book = json.loads(path.read_text())
+    except (OSError, ValueError):
+        book = {}
+    if reset:
+        book.pop(name, None)
+    elif name not in book:
+        book[name] = time.time()
+    path.write_text(json.dumps(book))
+    return book.get(name, time.time())
+
+
 def run_one(source, cfg, dirs, provider):
     job = Job(source, cfg, dirs)
     try:
@@ -82,9 +102,32 @@ def run_one(source, cfg, dirs, provider):
         job.check()
         result = job.render(provider)
         out_dir, muxed = job.deliver(result)
+        waiting_since(cfg, job.name, reset=True)
         print(f"[done] {job.name} -> {out_dir} ({muxed['frames']} frames)")
         return out_dir
+    except Busy as exc:
+        # No machine was free. That is RunPod's weather, not a problem with the file,
+        # so the job goes back in the queue and keeps its place.
+        first = waiting_since(cfg, job.name)
+        hours = (time.time() - first) / 3600
+        job.log(f"BUSY {exc}")
+        if hours < PATIENCE_HOURS:
+            job.requeue(
+                "Waiting for a free render machine.",
+                f"All the graphics cards are busy right now. This keeps trying by itself"
+                f" and starts the moment one frees up. Waiting {int(hours * 60)} minutes"
+                f" so far. Nothing is wrong with your file and nothing has been charged.")
+            print(f"[waiting] {job.name}: no GPU free, {int(hours * 60)} min so far")
+            return None
+        waiting_since(cfg, job.name, reset=True)
+        out = job.reject(Rejected(
+            f"No render machine came free in {PATIENCE_HOURS} hours, so this was put"
+            " aside. Nothing is wrong with your file and nothing has been charged."
+            " Upload it again later and it will render.", str(exc)))
+        print(f"[gave up] {job.name}: no GPU for {PATIENCE_HOURS}h")
+        return out
     except Rejected as exc:
+        waiting_since(cfg, job.name, reset=True)
         out = job.reject(exc)
         print(f"[needs a fix] {job.name}: {exc.message}")
         return out

@@ -83,33 +83,35 @@ class RunPodProvider:
             log(f"RD_SWEEP terminated leftover pods: {', '.join(killed)}")
         return killed
 
-    def _create(self, job_name, log):
-        wanted = [g.strip() for g in self.cfg["GPU_PREFERENCE"].split(",") if g.strip()]
-        public = Path(str(self.key) + ".pub").read_text().strip()
-        cap = float(self.cfg["GPU_MAX_USD_PER_HOUR"])
-        errors = []
-        for gpu_id in wanted:
-            body = {
-                "name": f"{POD_PREFIX}{job_name}"[:191],
-                "image": self.cfg["RUNPOD_IMAGE"],
-                "gpu": {"id": gpu_id, "count": 1},
-                "cloud": "SECURE",
-                "disk": 20,
-                "ports": ["22/tcp"],
-                "startSsh": True,
-                # RunPod's docs name both PUBLIC_KEY and SSH_PUBLIC_KEY depending on the
-                # image. Sending both costs nothing and avoids finding out which on a
-                # pod that is already billing.
-                "env": {"PUBLIC_KEY": public, "SSH_PUBLIC_KEY": public},
-                "mounts": {"network": [{"volumeId": self.cfg["RUNPOD_VOLUME_ID"],
-                                        "path": "/workspace"}]},
-            }
+    def _pod_body(self, job_name, gpu_id, public, use_volume):
+        body = {
+            "name": f"{POD_PREFIX}{job_name}"[:191],
+            "image": self.cfg["RUNPOD_IMAGE"],
+            "gpu": {"id": gpu_id, "count": 1},
+            "cloud": "SECURE",
+            "disk": 30,
+            "ports": ["22/tcp"],
+            "startSsh": True,
+            # RunPod's docs name both PUBLIC_KEY and SSH_PUBLIC_KEY depending on the
+            # image. Sending both costs nothing and avoids finding out which on a
+            # pod that is already billing.
+            "env": {"PUBLIC_KEY": public, "SSH_PUBLIC_KEY": public},
+        }
+        if use_volume:
+            body["mounts"] = {"network": [{"volumeId": self.cfg["RUNPOD_VOLUME_ID"],
+                                           "path": "/workspace"}]}
             # A network volume lives in one data centre and a pod can only attach it
             # from inside that same one, so asking elsewhere fails in a confusing way.
             if self.cfg.get("RUNPOD_DATA_CENTER"):
                 body["dataCenterIds"] = [self.cfg["RUNPOD_DATA_CENTER"]]
+        return body
+
+    def _try_gpus(self, job_name, public, use_volume, log):
+        cap = float(self.cfg["GPU_MAX_USD_PER_HOUR"])
+        errors = []
+        for gpu_id in [g.strip() for g in self.cfg["GPU_PREFERENCE"].split(",") if g.strip()]:
             try:
-                pod = self.client.create_pod(body)
+                pod = self.client.create_pod(self._pod_body(job_name, gpu_id, public, use_volume))
             except runpod_api.RunPodError as exc:
                 errors.append(f"{gpu_id}: {exc}")
                 log(f"RD_POD {gpu_id} unavailable, trying the next one")
@@ -119,9 +121,26 @@ class RunPodProvider:
                 self.client.terminate_pod(pod["id"])
                 errors.append(f"{gpu_id}: ${cost}/hr is over the ${cap}/hr cap")
                 continue
-            log(f"RD_POD {pod['id']} {gpu_id} ${cost:.2f}/hr")
-            return pod
-        raise RuntimeError("no GPU could be rented right now.\n" + "\n".join(errors))
+            log(f"RD_POD {pod['id']} {gpu_id} ${cost:.2f}/hr"
+                f"{'' if use_volume else ' (no volume: this data centre was empty)'}")
+            return pod, errors
+        return None, errors
+
+    def _create(self, job_name, log):
+        public = Path(str(self.key) + ".pub").read_text().strip()
+        pod, errors = self._try_gpus(job_name, public, True, log)
+        if pod:
+            return pod, True
+
+        # The volume pins us to one data centre, and that one can be completely out of
+        # GPUs. Rather than tell the editor to come back later, rent wherever there is
+        # capacity and accept that this job cannot resume if it dies.
+        log("RD_POD nothing free where the volume lives, trying other data centres")
+        pod, more = self._try_gpus(job_name, public, False, log)
+        if pod:
+            return pod, False
+        raise preflight.Busy("no GPU could be rented right now, anywhere. RunPod said:\n"
+                             + "\n".join(errors + more))
 
     def _wait_ready(self, pod_id, log, timeout=600):
         deadline = time.time() + timeout
@@ -156,7 +175,8 @@ class RunPodProvider:
         result = {"provider": self.name, "cost_usd": 0.0}
         try:
             self.sweep_orphans(log)
-            pod = self._create(job, log)
+            pod, on_volume = self._create(job, log)
+            result["resumable"] = on_volume
             result["pod_id"] = pod["id"]
             result["gpu"] = (pod.get("gpu") or {}).get("id", "unknown")
             rate = float(pod.get("cost") or 0)

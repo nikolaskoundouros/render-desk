@@ -249,13 +249,29 @@ class Job:
             shutil.rmtree(self.frames, ignore_errors=True)
         return out_dir, {"frames": rendered}
 
+    def requeue(self, headline, detail):
+        """Put the file back in the queue, keeping the editor informed. Used when the
+        problem is capacity rather than the file."""
+        self.status(headline, detail)
+        status = self.dir / "STATUS.txt"
+        if status.exists():
+            status.replace(self.inbox / f".status-{Path(self.name).stem}.txt")
+        back = self.inbox / self.name
+        if not back.exists():
+            shutil.move(str(self.dir / self.name if (self.dir / self.name).exists()
+                            else self.blend), str(back))
+        shutil.rmtree(self.dir, ignore_errors=True)
+        return back
+
     def reject(self, exc):
         out = self.problems / self.dir.name
         out.mkdir(parents=True, exist_ok=True)
-        body = f"{self.name}\n\nThis file was not rendered.\n\n{exc.message}\n"
+        # Plain English only. The editor is not a programmer and a traceback in his
+        # face is a bug, not information.
+        (out / "WHAT-WENT-WRONG.txt").write_text(
+            f"{self.name}\n\nThis file was not rendered.\n\n{exc.message}\n")
         if getattr(exc, "detail", ""):
-            body += f"\n--- details for Nick ---\n{exc.detail}\n"
-        (out / "WHAT-WENT-WRONG.txt").write_text(body)
+            self.log("REJECTED\n" + exc.detail)
         for item in self.dir.iterdir():
             if item.name != "STATUS.txt":
                 shutil.move(str(item), str(out / item.name))
