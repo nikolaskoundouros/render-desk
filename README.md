@@ -31,6 +31,29 @@ Put `_draft` in a filename for a half-size, 32-sample look test that costs cents
 `PROVIDER=local` renders on this Mac for free and is how the desk was proven.
 `PROVIDER=runpod` rents a GPU per job and destroys it afterwards.
 
+## On the box
+
+    ssh root@46.62.230.121
+    systemctl status render-desk          # is it running
+    journalctl -u render-desk -f          # watch a job happen
+    rd-visits 30                          # who hit the page in the last 30 minutes
+    cd /opt/render-desk && python3 bin/renderdesk doctor
+
+Deploy from this Mac with `deploy/ship.sh`. It never touches `/etc/render-desk/render.env`,
+which holds the secrets; that is written once by `deploy/configure.sh`.
+
+## What renting a GPU is actually like
+
+Measured, not guessed:
+
+- **Capacity fluctuates hard.** One job found all ten GPU types unavailable in EU-RO-1
+  and fell back to another data centre; nine minutes later an L4 was free there. A job
+  that finds nothing waits and retries rather than failing.
+- **Setup is 1 to 5 minutes per job**, mostly downloading Blender. The network volume
+  caches it, so only the first job in a given data centre pays the full price.
+- **That overhead is charged once per clip, not per frame.** A 3-frame test that takes
+  5 minutes to set up is not "100 seconds per frame".
+
 ## Cost
 
 `bin/renderdesk cost` reads the ledger of real renders and projects the monthly bill:
