@@ -7,6 +7,14 @@
 # certificate and will retry noisily.
 HOSTNAME {
 	encode zstd gzip
+	# The editor works from a phone on other people's wifi. Without this there is no
+	# way to tell a broken deploy from a dropped connection on his end.
+	# To the journal, not a file: Caddy's unit is sandboxed and cannot write new
+	# paths, and a reload that fails leaves a config on disk that breaks the next
+	# restart. Read it with: journalctl -u caddy | grep render-desk
+	log {
+		output stderr
+	}
 	header {
 		Strict-Transport-Security "max-age=31536000"
 		X-Content-Type-Options "nosniff"
