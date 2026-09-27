@@ -32,6 +32,7 @@ class RunPodProvider:
                 "then add the .pub to your RunPod account settings."
             )
         self.version = cfg["BLENDER_VERSION"]
+        self.expected_frames = 0
 
     # --- ssh -----------------------------------------------------------------
     def _ssh_base(self, target):
@@ -179,6 +180,7 @@ class RunPodProvider:
             result["resumable"] = on_volume
             result["pod_id"] = pod["id"]
             result["gpu"] = (pod.get("gpu") or {}).get("id", "unknown")
+            result["data_centre"] = pod.get("dataCenterId") or "?"
             rate = float(pod.get("cost") or 0)
             pod, target = self._wait_ready(pod["id"], log)
             rate = float(pod.get("cost") or rate)
@@ -219,6 +221,7 @@ class RunPodProvider:
                 report = json.loads(local_report.read_text())
                 local_report.unlink(missing_ok=True)
                 on_scene(report)
+                self.expected_frames = report["frames"]
                 opts = dict(opts, fps=report["fps"])
             cmd = (f"{blender} -b {shlex.quote(remote_blend)} --factory-startup -noaudio "
                    f"--python /workspace/render_job.py -- --out {shlex.quote(remote_frames)} "
@@ -227,7 +230,12 @@ class RunPodProvider:
                 cmd += f" --samples {int(opts['samples'])}"
             if opts.get("scale"):
                 cmd += f" --scale {int(opts['scale'])}"
+            render_started = time.time()
             self._run(target, cmd, log)
+            # Renting, booting and downloading Blender is a fixed cost per job. Mixing
+            # it into the per-frame number makes a 3-frame test look 30x slower than a
+            # real clip, which would wreck the monthly projection.
+            result["render_seconds"] = round(time.time() - render_started, 1)
 
             counted = self._run(target, f"ls {remote_frames}/frame_*.png 2>/dev/null | wc -l")
             result["frames_rendered"] = int((counted[-1] if counted else "0").strip() or 0)
@@ -251,6 +259,18 @@ class RunPodProvider:
             self._copy(target, frames_dir / "preview.png", middle.strip(), up=False)
             result["mp4"] = frames_dir / "render.mp4"
             result["preview"] = frames_dir / "preview.png"
+
+            # The video is safely down, so this job's frames can leave the volume.
+            # A 20 GB volume holds only a handful of 1080x1920 sequences, and frames
+            # are worth keeping only while they might still be resumed. Deleting after
+            # the download means a failed transfer still leaves them to resume from.
+            if result["frames_rendered"] >= (self.expected_frames or 0):
+                try:
+                    self._run(target, f"rm -rf {shlex.quote(remote_frames)} "
+                                      f"{shlex.quote(remote_job)}")
+                    log("RD_CLEANUP frames removed from the volume")
+                except Exception as exc:
+                    log(f"RD_CLEANUP could not remove frames: {exc}")
             return result
         finally:
             elapsed = time.time() - started

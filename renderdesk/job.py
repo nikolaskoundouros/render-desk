@@ -211,14 +211,18 @@ class Job:
 
         total = self.report["frames"]
         seconds = result.get("seconds", 0)
-        per_frame = seconds / rendered if rendered else 0
+        rendering = result.get("render_seconds", seconds)
+        overhead = max(0.0, seconds - rendering)
+        per_frame = rendering / rendered if rendered else 0
         ledger.append(self.cfg, {
             "when": dt.datetime.now().isoformat(timespec="seconds"),
             "job": self.name,
             "provider": result.get("provider", "?"),
             "gpu": result.get("gpu", ""),
+            "data_centre": result.get("data_centre", ""),
             "frames": rendered,
             "seconds": round(seconds, 1),
+            "render_seconds": round(rendering, 1),
             "seconds_per_frame": round(per_frame, 2),
             "usd_per_hour": result.get("usd_per_hour", 0),
             "cost_usd": round(result.get("cost_usd", 0), 4),
@@ -231,7 +235,8 @@ class Job:
             f"{rendered / max(self.report['fps'], 1):.1f} seconds of video.\n"
             f"Quality: {self.opts['label']}\n"
             f"Rendered on: {result.get('gpu') or result.get('device', 'unknown')}\n"
-            f"Render time: {human_time(seconds)} ({per_frame:.1f} seconds per frame)\n"
+            f"Render time: {human_time(rendering)} ({per_frame:.1f} seconds per frame)\n"
+            f"Plus {human_time(overhead)} renting and starting the machine\n"
             f"Cost: ${result.get('cost_usd', 0):.2f}\n\n"
             "The preview image is one frame from the middle, so you can check the look"
             " without opening the video.\n"

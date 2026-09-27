@@ -63,12 +63,18 @@ def main():
             print("tell you the monthly bill for your whole batch.")
             return 0
         print(f"  measured over {out['jobs']} GPU job(s), {out['frames']} frames")
-        print(f"  {out['seconds_per_frame']} seconds per frame")
-        print(f"  ${out['usd_per_frame']:.5f} per frame")
+        print(f"  {out['seconds_per_frame']} seconds per frame while rendering")
+        print(f"  {out['overhead_seconds']}s per job renting and starting a machine")
+        print(f"  ${out['usd_per_hour']:.2f} per hour paid on average")
         print(f"  ${out['usd_so_far']:.2f} spent so far")
         print()
         print(f"  {out['plan']} = {out['planned_frames']} frames")
+        print(f"  ${out['usd_per_clip']:.2f} per clip")
         print(f"  projected: ${out['projected_usd']:.2f} per month")
+        if out["thin"]:
+            print()
+            print("  Careful: this is measured on very few frames, so the per-frame")
+            print("  number is rough. Render one real clip before trusting it.")
         return 0
     if args.cmd == "watch":
         watch.loop(cfg)
