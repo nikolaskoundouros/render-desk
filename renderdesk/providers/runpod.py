@@ -100,6 +100,10 @@ class RunPodProvider:
                 "mounts": {"network": [{"volumeId": self.cfg["RUNPOD_VOLUME_ID"],
                                         "path": "/workspace"}]},
             }
+            # A network volume lives in one data centre and a pod can only attach it
+            # from inside that same one, so asking elsewhere fails in a confusing way.
+            if self.cfg.get("RUNPOD_DATA_CENTER"):
+                body["dataCenterIds"] = [self.cfg["RUNPOD_DATA_CENTER"]]
             try:
                 pod = self.client.create_pod(body)
             except runpod_api.RunPodError as exc:

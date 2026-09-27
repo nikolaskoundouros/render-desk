@@ -84,8 +84,8 @@ class Job:
         body += (
             f"\nQuality: {self.opts['label']}"
             f"\nStarted: {dt.datetime.fromtimestamp(self.started):%H:%M on %d %b}"
-            "\n\nNothing for you to do. The finished video appears in 3-finished."
-            " If something is wrong with the file it moves to 4-needs-a-fix with an explanation.\n"
+            "\n\nNothing for you to do. The finished video appears here when it is ready."
+            " If the file cannot be rendered you get a note saying what to change.\n"
         )
         (self.dir / "STATUS.txt").write_text(body)
 
@@ -213,8 +213,8 @@ class Job:
             f"Rendered on: {result.get('gpu') or result.get('device', 'unknown')}\n"
             f"Render time: {human_time(seconds)} ({per_frame:.1f} seconds per frame)\n"
             f"Cost: ${result.get('cost_usd', 0):.2f}\n\n"
-            "The mp4 is next to this file. preview.png is one frame from the middle,"
-            " so you can see the look without opening the video.\n"
+            "The preview image is one frame from the middle, so you can check the look"
+            " without opening the video.\n"
         )
         if self.log_path.exists():
             shutil.copy2(self.log_path, out_dir / "technical-log.txt")

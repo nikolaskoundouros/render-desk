@@ -15,6 +15,9 @@ def main():
     sub.add_parser("watch", help="watch the drop folder forever (what launchd runs)")
     sub.add_parser("once", help="handle whatever is in the drop folder, then exit")
     sub.add_parser("doctor", help="check the setup without rendering anything")
+    serve = sub.add_parser("serve", help="the web page the editor uses, plus the watcher")
+    serve.add_argument("--no-watcher", action="store_true")
+    sub.add_parser("password", help="set the editor's password")
     cost = sub.add_parser("cost", help="what rendering has actually cost, and the monthly projection")
     cost.add_argument("--clips", type=int, default=25)
     cost.add_argument("--seconds", type=int, default=35)
@@ -27,6 +30,30 @@ def main():
     cfg = config.load()
     if args.cmd == "doctor":
         return watch.doctor(cfg)
+    if args.cmd == "password":
+        import re
+        import secrets
+
+        words = secrets.token_urlsafe(12)
+        path = config.ENV_PATH
+        path.parent.mkdir(parents=True, exist_ok=True)
+        text = path.read_text() if path.exists() else ""
+        if re.search(r"^EDITOR_PASSWORD=.*$", text, re.M):
+            text = re.sub(r"^EDITOR_PASSWORD=.*$", f"EDITOR_PASSWORD={words}", text, flags=re.M)
+        else:
+            text += f"\nEDITOR_PASSWORD={words}\n"
+        path.write_text(text)
+        path.chmod(0o600)
+        print("Password set. Send this to your editor, then delete the message:\n")
+        print(f"    {words}\n")
+        print("Anyone signed in already stays signed in. To cut everyone off, delete")
+        print(f"{Path(cfg['STATE_DIR']) / 'session.key'} and run this again.")
+        return 0
+    if args.cmd == "serve":
+        from renderdesk import web
+
+        web.serve(cfg, with_watcher=not args.no_watcher)
+        return 0
     if args.cmd == "cost":
         from renderdesk import ledger
 

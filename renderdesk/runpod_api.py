@@ -11,6 +11,10 @@ import urllib.request
 
 BASE = "https://api.runpod.io/v2"
 
+# RunPod sits behind Cloudflare, which rejects the default urllib user agent with
+# a 403 "error code: 1010" that looks exactly like a bad API key. Any real name works.
+USER_AGENT = "render-desk/1.0"
+
 
 class RunPodError(RuntimeError):
     pass
@@ -29,6 +33,7 @@ class Client:
         req = urllib.request.Request(url, data=data, method=method)
         req.add_header("Authorization", f"Bearer {self.api_key}")
         req.add_header("Content-Type", "application/json")
+        req.add_header("User-Agent", USER_AGENT)
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
                 raw = resp.read().decode()

@@ -5,4 +5,5 @@ set -e
 ROOT=$(cd "$(dirname "$0")" && pwd)
 "$ROOT/checks/end_to_end.sh"
 "$ROOT/checks/runpod_contract.sh"
+"$ROOT/checks/web_check.sh"
 echo "verify.sh: PASS"

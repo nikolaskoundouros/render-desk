@@ -149,6 +149,12 @@ check("ssh target is None before the pod is ready",
 # --- v1 is retired on 15 Nov 2026, so the base URL must be v2 --------------
 check("targets API v2", runpod_api.BASE == "https://api.runpod.io/v2", runpod_api.BASE)
 
+# Cloudflare answers the default urllib user agent with a 403 that reads exactly
+# like a rejected API key. This cost an hour once; it does not get to happen twice.
+check("sends a real user agent past Cloudflare",
+      bool(runpod_api.USER_AGENT) and "urllib" not in runpod_api.USER_AGENT.lower(),
+      runpod_api.USER_AGENT)
+
 if failures:
     print("\nrunpod_contract FAILED:\n  " + "\n  ".join(failures), file=sys.stderr)
     sys.exit(1)
