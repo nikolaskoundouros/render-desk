@@ -235,7 +235,10 @@ drop.addEventListener('drop', ev => ev.dataTransfer.files[0] && upload(ev.dataTr
 
 const MAXMB = parseInt(document.getElementById('limit').dataset.mb, 10);
 const CHUNK = 4 * 1024 * 1024;
-const LANES = 4;   // chunks in flight at once: latency, not bandwidth, is the limit
+// Chunks in flight at once. The editor's line is 30 Mbps but he was reaching 0.7
+// to Helsinki, a 43x gap: one TCP stream collapses on a long lossy route, and the
+// only cure is many of them. This is what S3 and Drive multipart uploads do.
+const LANES = 16;
 const uploadId = f => `${f.name}|${f.size}|${f.lastModified}`
   .replace(/[^A-Za-z0-9|._-]/g, '_');
 
