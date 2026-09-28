@@ -23,6 +23,8 @@ DEFAULTS = {
     "BLENDER_VERSION": "5.1.2",
     "BLENDER_DOWNLOAD": "",
     "POLL_SECONDS": "30",
+    "DRIVE_REMOTE": "",
+    "DRIVE_POLL_SECONDS": "60",
     "WEB_PORT": "8630",
     "WEB_HOST": "127.0.0.1",
     "EDITOR_PASSWORD": "",

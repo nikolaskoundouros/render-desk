@@ -7,7 +7,7 @@ from pathlib import Path
 
 import datetime as dt
 
-from . import config, ledger, providers
+from . import config, drive, ledger, providers
 from .job import Job, settled
 from .preflight import Busy, Rejected
 
@@ -149,7 +149,19 @@ def loop(cfg, once=False):
     inbox = dirs[0]
     provider = providers.get(cfg["PROVIDER"], cfg)
     print(f"render-desk watching {inbox}  provider={provider.name}")
+    if drive.configured(cfg):
+        print(f"also pulling from Google Drive: {cfg['DRIVE_REMOTE']}")
+    last_drive = 0.0
     while True:
+        # Files can arrive two ways: uploaded on the page, or dropped in the shared
+        # Drive folder. Drive is there because the editor's route to this box is slow
+        # while his route to Google is not.
+        if drive.configured(cfg) and time.time() - last_drive >= int(cfg["DRIVE_POLL_SECONDS"]):
+            last_drive = time.time()
+            try:
+                drive.fetch_new(cfg)
+            except Exception as exc:
+                print(f"[drive] could not check the folder: {exc}")
         for source in candidates(inbox):
             if not settled(source):
                 print(f"[wait] {source.name} is still uploading")
@@ -172,6 +184,14 @@ def doctor(cfg):
         rows.append(("ffmpeg", shutil.which(cfg.get("FFMPEG", "ffmpeg")) or "MISSING", ""))
     rows.append(("drop folder", "ok" if inbox.exists() else "MISSING", str(inbox)))
     rows.append(("provider", cfg["PROVIDER"], ""))
+    if cfg.get("DRIVE_REMOTE"):
+        try:
+            found = len(drive.listing(cfg))
+            rows.append(("google drive", f"ok, {found} scene file(s) waiting", cfg["DRIVE_REMOTE"]))
+        except Exception as exc:
+            rows.append(("google drive", "MISSING", str(exc)[:80]))
+    else:
+        rows.append(("google drive", "not set up", "optional"))
     day_left, month_left = budget_left(cfg)
     rows.append(("budget left", f"${day_left:.2f} today, ${month_left:.2f} this month", ""))
     if cfg["PROVIDER"] == "runpod":
