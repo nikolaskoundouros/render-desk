@@ -66,15 +66,48 @@ def inspect(blend, blender_bin):
 def gate(report):
     """Raise Rejected on anything that would waste a paid render."""
     if report["missing_files"]:
-        shown = "\n".join(f"  - {p}" for p in report["missing_files"][:8])
-        extra = len(report["missing_files"]) - 8
+        missing = report["missing_files"]
+        shown = "\n".join(f"  - {p}" for p in missing[:8])
+        extra = len(missing) - 8
         more = f"\n  ...and {extra} more" if extra > 0 else ""
+
+        # Linked .blend libraries and missing textures look the same in the report
+        # and have completely different fixes. Packing does not touch libraries, so
+        # telling someone to pack resources when the problem is a linked character
+        # sends them round in circles.
+        libraries = [p for p in missing if p.lower().endswith(".blend")]
+        others = [p for p in missing if not p.lower().endswith(".blend")]
+
+        if libraries and not others:
+            raise Rejected(
+                f"This scene links to {len(libraries)} other Blender file(s) that only exist "
+                "on your machine, so the character, props or set would be missing.\n\n"
+                "Packing resources does NOT fix this: it only packs images and sounds, not "
+                "linked .blend files.\n\n"
+                "Save a copy of your scene first, then in that copy do:\n"
+                "  File > External Data > Make Local > All\n"
+                "then save and send that copy. It brings the linked characters and props "
+                "into the file itself.",
+                shown + more,
+            )
+        if libraries and others:
+            raise Rejected(
+                f"{len(missing)} file(s) this scene needs are not inside the .blend.\n\n"
+                f"{len(others)} are images or similar. Fix those with:\n"
+                "  File > External Data > Automatically Pack Resources\n\n"
+                f"{len(libraries)} are linked Blender files, which packing does NOT cover. "
+                "Fix those with:\n"
+                "  File > External Data > Make Local > All\n\n"
+                "Save a copy first, do both, then send the copy.",
+                shown + more,
+            )
         raise Rejected(
-            f"{len(report['missing_files'])} file(s) this scene needs are not inside the .blend, so "
-            "the render would come out with missing textures. In Blender: File > External Data > "
+            f"{len(missing)} file(s) this scene needs are not inside the .blend, so the "
+            "render would come out with missing textures. In Blender: File > External Data > "
             "Automatically Pack Resources, save, then drop it again.",
             shown + more,
         )
+
     if not report["camera"]:
         raise Rejected(
             "This scene has no camera, so there is no shot to render. Add a camera in Blender "
