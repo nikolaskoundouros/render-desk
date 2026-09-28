@@ -64,7 +64,12 @@ def inspect(blend, blender_bin):
 
 
 def gate(report):
-    """Raise Rejected on anything that would waste a paid render."""
+    """Raise Rejected on anything that would waste a paid render.
+
+    Note what is NOT a failure: a linked library with no users. Blender keeps the
+    entry after data has been made local, and refusing a file for a leftover would
+    send the editor chasing something that does not matter.
+    """
     if report["missing_files"]:
         missing = report["missing_files"]
         shown = "\n".join(f"  - {p}" for p in missing[:8])

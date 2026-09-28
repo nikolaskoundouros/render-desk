@@ -13,14 +13,23 @@ def main(out_path):
     scene = bpy.context.scene
     render = scene.render
 
-    missing = []
-    for path in bpy.utils.blend_paths(absolute=True, packed=False, local=False):
-        if path and not os.path.exists(bpy.path.abspath(path)):
-            missing.append(path)
+    # A linked library that nothing actually uses is a leftover, not a problem. The
+    # scene renders fine without it, so blocking on one would refuse a good file.
+    missing, stale = [], []
+    libraries = {}
     for lib in bpy.data.libraries:
         target = bpy.path.abspath(lib.filepath)
+        users = getattr(lib, "users_id", None)
+        count = len(users) if users is not None else -1
+        libraries[lib.filepath] = count
         if target and not os.path.exists(target):
-            missing.append(lib.filepath)
+            (missing if count != 0 else stale).append(lib.filepath)
+
+    for path in bpy.utils.blend_paths(absolute=True, packed=False, local=False):
+        if not path or path in libraries:
+            continue
+        if not os.path.exists(bpy.path.abspath(path)):
+            missing.append(path)
 
     report = {
         "blender_running": list(bpy.app.version),
@@ -37,6 +46,8 @@ def main(out_path):
         ],
         "resolution_percentage": render.resolution_percentage,
         "missing_files": sorted(set(missing)),
+        "stale_links": sorted(set(stale)),
+        "libraries": {k: v for k, v in sorted(libraries.items())},
         "objects": len(scene.objects),
         "packed_images": sum(1 for i in bpy.data.images if i.packed_file),
     }
