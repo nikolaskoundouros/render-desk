@@ -54,6 +54,20 @@ Measured, not guessed:
 - **That overhead is charged once per clip, not per frame.** A 3-frame test that takes
   5 minutes to set up is not "100 seconds per frame".
 
+## Samples: 128, decided by looking
+
+Measured on Injection_Clip_v06 on 2026-09-28, frames 200, 445 and 700 rendered at
+both 128 and 256 samples on the same 4090:
+
+- PSNR between the two: 47 to 50 dB, above the range where a difference is visible
+- Nick compared them at full pixel size and could not tell them apart
+- 256 costs 2.4x, not 2x
+
+So 128 stays. This scene is clean geometry and smooth shading, not glass or
+volumetrics, which is why it converges so early. Re-run the comparison if a future
+clip has caustics, heavy volumetrics or thin transparent surfaces, because those
+are the cases where the answer changes.
+
 ## Cost
 
 `bin/renderdesk cost` reads the ledger of real renders and projects the monthly bill:
