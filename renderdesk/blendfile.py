@@ -21,25 +21,53 @@ MAGIC = b"BLENDER"
 
 
 def _head(path, size=64):
+    """The first bytes of the file, decompressing if it is a compressed .blend.
+
+    A compressed stream emits nothing until it has a whole block, so feeding it a
+    few KB returns an empty string and the file looks like it is not a .blend at
+    all. That is exactly how a real 300 MB scene was rejected. Read a growing
+    window until the decoder produces something.
+    """
     with open(path, "rb") as fh:
-        raw = fh.read(max(size, 4096))
-    if raw.startswith(MAGIC):
-        return raw
+        first = fh.read(8)
+        if first.startswith(MAGIC):
+            return first + fh.read(max(size, 256))
+
+        for window in (1 << 16, 1 << 18, 1 << 21, 1 << 23):
+            fh.seek(0)
+            raw = fh.read(window)
+            head = _decompress(raw, size)
+            if head.startswith(MAGIC):
+                return head
+            if len(raw) < window:      # whole file read, no point growing
+                break
+    raise ValueError("not a .blend file")
+
+
+def _decompress(raw, size):
     if raw.startswith(b"\x1f\x8b"):
-        with gzip.open(io.BytesIO(raw)) as gz:
-            return gz.read(size)
+        try:
+            with gzip.open(io.BytesIO(raw)) as gz:
+                return gz.read(max(size, 256))
+        except OSError:
+            return b""
     if raw.startswith(b"\x28\xb5\x2f\xfd"):
         try:
             from compression import zstd
         except ImportError:
             try:
                 import zstandard
-
-                return zstandard.ZstdDecompressor().decompressobj().decompress(raw, size)
             except ImportError:
                 raise ValueError("file is zstd-compressed and no zstd decoder is available")
-        return zstd.ZstdDecompressor().decompress(raw, max_length=size)
-    raise ValueError("not a .blend file")
+            try:
+                return zstandard.ZstdDecompressor().decompressobj().decompress(raw)[:max(size, 256)]
+            except zstandard.ZstdError:
+                return b""
+        try:
+            return zstd.ZstdDecompressor().decompress(raw, max_length=max(size, 256))
+        except zstd.ZstdError:
+            return b""
+    return b""
 
 
 def version(path):
