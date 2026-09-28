@@ -15,7 +15,7 @@ from .preflight import Busy, Rejected
 PATIENCE_HOURS = 3
 
 ACCEPTS = {".blend", ".zip"}
-IGNORE_PREFIXES = (".", "~", "_")
+IGNORE_PREFIXES = (".", "~")
 
 EDITOR_NOTE = """HOW TO RENDER A CLIP
 

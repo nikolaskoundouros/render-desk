@@ -52,6 +52,29 @@ def valid(cfg, token):
         return False
 
 
+def part_path(inbox, upload_id, name):
+    """Where a partial upload accumulates.
+
+    The id comes from the browser, so it never reaches the filesystem directly: the
+    filename is a hash of it. A dot prefix keeps the watcher from ever seeing a
+    half-finished file.
+    """
+    digest = hashlib.sha256(f"{upload_id}\x00{name}".encode()).hexdigest()[:24]
+    return inbox / f".part-{digest}"
+
+
+def sweep_parts(inbox, older_than_hours=24):
+    """Abandoned uploads are rubbish after a day. Without this they accumulate
+    silently until the disk is full."""
+    cutoff = time.time() - older_than_hours * 3600
+    for path in inbox.glob(".part-*"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            pass
+
+
 def safe_name(name):
     """A filename the editor typed is not a path. Strip it back to one."""
     name = os.path.basename((name or "").replace("\\", "/")).strip()
@@ -176,27 +199,68 @@ file.onchange = () => file.files[0] && upload(file.files[0]);
 drop.addEventListener('drop', ev => ev.dataTransfer.files[0] && upload(ev.dataTransfer.files[0]));
 
 const MAXMB = parseInt(document.getElementById('limit').dataset.mb, 10);
-function upload(f) {
+const CHUNK = 4 * 1024 * 1024;
+const uploadId = f => `${f.name}|${f.size}|${f.lastModified}`
+  .replace(/[^A-Za-z0-9|._-]/g, '_');
+
+async function upload(f) {
   if (!/\\.(blend|zip)$/i.test(f.name)) { note.textContent = 'That needs to be a .blend or a .zip.'; return; }
   if (f.size > MAXMB * 1024 * 1024) {
     note.textContent = 'That file is ' + Math.round(f.size / 1048576) + ' MB, over the ' + MAXMB
       + ' MB limit. Ask Nick to raise it, or send the .blend without the heavy textures.';
     return;
   }
-  const xhr = new XMLHttpRequest();
-  xhr.open('PUT', '/upload?name=' + encodeURIComponent(f.name));
+  const id = uploadId(f), q = `id=${encodeURIComponent(id)}&name=${encodeURIComponent(f.name)}`;
   barwrap.hidden = false;
-  note.textContent = 'Uploading ' + f.name + '...';
-  xhr.upload.onprogress = e => { if (e.lengthComputable) bar.style.width = (e.loaded / e.total * 100) + '%'; };
-  xhr.onload = () => {
-    barwrap.hidden = true; bar.style.width = '0';
-    note.textContent = xhr.status === 200
-      ? f.name + ' received. It appears below within a minute.'
-      : 'Upload failed: ' + xhr.responseText;
-    refresh();
+  drop.style.pointerEvents = 'none';
+
+  // Ask the server how much of this exact file it already has, so a dropped
+  // connection costs one chunk rather than the whole upload.
+  let sent = 0;
+  try {
+    const r = await fetch(`/upload/status?${q}`);
+    if (r.ok) sent = (await r.json()).received || 0;
+  } catch (e) { /* start from zero */ }
+  if (sent) note.textContent = 'Carrying on from ' + Math.round(sent / 1048576) + ' MB...';
+
+  const show = () => {
+    bar.style.width = (sent / f.size * 100) + '%';
+    note.textContent = `Uploading ${f.name}: ${Math.round(sent / 1048576)}`
+      + ` of ${Math.round(f.size / 1048576)} MB`;
   };
-  xhr.onerror = () => { barwrap.hidden = true; note.textContent = 'Upload failed. Try again.'; };
-  xhr.send(f);
+  show();
+
+  let failures = 0;
+  while (sent < f.size) {
+    const end = Math.min(sent + CHUNK, f.size);
+    try {
+      const res = await fetch(`/upload?${q}&offset=${sent}&total=${f.size}`,
+                              {method: 'PUT', body: f.slice(sent, end)});
+      if (res.status === 409) { sent = (await res.json()).received || 0; show(); continue; }
+      if (!res.ok) throw new Error(await res.text());
+      const out = await res.json();
+      sent = out.received;
+      failures = 0;
+      show();
+      if (out.done) {
+        barwrap.hidden = true; bar.style.width = '0'; drop.style.pointerEvents = '';
+        note.textContent = f.name + ' received. It appears below within a minute.';
+        refresh();
+        return;
+      }
+    } catch (e) {
+      failures += 1;
+      if (failures > 8) {
+        drop.style.pointerEvents = '';
+        note.textContent = 'Upload keeps dropping. Your progress is saved, so choose the'
+          + ' same file again and it carries on from ' + Math.round(sent / 1048576) + ' MB.';
+        return;
+      }
+      note.textContent = `Connection dropped at ${Math.round(sent / 1048576)} MB,`
+        + ` trying again (${failures} of 8)...`;
+      await new Promise(r => setTimeout(r, 2000 * failures));
+    }
+  }
 }
 
 const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -309,6 +373,13 @@ class Handler(BaseHTTPRequestHandler):
         if path == "/":
             return self.send(HTTPStatus.OK,
                              PAGE.replace("__MAXMB__", str(int(self.cfg["MAX_UPLOAD_MB"]))))
+        if path == "/upload/status":
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
+            target = part_path(self.dirs[0], query.get("id", [""])[0],
+                               safe_name(query.get("name", [""])[0]))
+            have = target.stat().st_size if target.exists() else 0
+            return self.send(HTTPStatus.OK, json.dumps({"received": have}),
+                             "application/json; charset=utf-8")
         if path == "/api/state":
             return self.send(HTTPStatus.OK, json.dumps(collect(self.dirs)),
                              "application/json; charset=utf-8")
@@ -372,49 +443,102 @@ class Handler(BaseHTTPRequestHandler):
         parsed = urllib.parse.urlparse(self.path)
         if parsed.path != "/upload":
             return self.send(HTTPStatus.NOT_FOUND, "Not found.", "text/plain; charset=utf-8")
-        name = safe_name(urllib.parse.parse_qs(parsed.query).get("name", [""])[0])
+        query = urllib.parse.parse_qs(parsed.query)
+        name = safe_name(query.get("name", [""])[0])
         if Path(name).suffix.lower() not in watch.ACCEPTS:
             return self.send(HTTPStatus.BAD_REQUEST, "Only .blend or .zip files.",
                              "text/plain; charset=utf-8")
-        length = int(self.headers.get("Content-Length") or 0)
+
         limit = int(self.cfg["MAX_UPLOAD_MB"]) * 1024 * 1024
-        if length <= 0:
-            return self.send(HTTPStatus.BAD_REQUEST, "Empty file.", "text/plain; charset=utf-8")
-        if length > limit:
+        length = int(self.headers.get("Content-Length") or 0)
+        total = int(query.get("total", ["0"])[0] or 0)
+        if (total or length) > limit:
             # Answer before reading the body: there is no reason to accept gigabytes
             # only to throw them away. The browser checks the size first anyway.
             return self.send(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
                              f"That file is bigger than the {self.cfg['MAX_UPLOAD_MB']} MB limit.",
                              "text/plain; charset=utf-8",
                              headers=(("Connection", "close"),))
+        if length <= 0:
+            return self.send(HTTPStatus.BAD_REQUEST, "Empty file.", "text/plain; charset=utf-8")
 
         inbox = self.dirs[0]
-        # Land it under a dot-name first: the watcher ignores those, so a half-uploaded
-        # file can never be picked up and rendered.
-        staging = inbox / f".part-{secrets.token_hex(4)}"
+        if not total:
+            return self.whole_file(inbox, name, length)
+        return self.one_chunk(inbox, name, length, total,
+                              query.get("id", [""])[0],
+                              int(query.get("offset", ["0"])[0] or 0))
+
+    def read_into(self, handle, length):
         written = 0
+        while written < length:
+            chunk = self.rfile.read(min(1 << 20, length - written))
+            if not chunk:
+                break
+            handle.write(chunk)
+            written += len(chunk)
+        return written
+
+    def whole_file(self, inbox, name, length):
+        """One request, one file. Fine on a fast connection; the chunked path below
+        is what survives a slow one."""
+        staging = inbox / f".part-{secrets.token_hex(4)}"
         try:
             with staging.open("wb") as fh:
-                while written < length:
-                    chunk = self.rfile.read(min(1 << 20, length - written))
-                    if not chunk:
-                        break
-                    fh.write(chunk)
-                    written += len(chunk)
+                written = self.read_into(fh, length)
             if written != length:
                 raise OSError(f"upload stopped early ({written} of {length} bytes)")
-            final = inbox / name
-            stem, suffix = Path(name).stem, Path(name).suffix
-            count = 2
-            while final.exists():
-                final = inbox / f"{stem}-{count}{suffix}"
-                count += 1
-            staging.replace(final)
+            self.land(staging, inbox, name)
         except OSError as exc:
             staging.unlink(missing_ok=True)
             return self.send(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc),
                              "text/plain; charset=utf-8")
         return self.send(HTTPStatus.OK, "ok", "text/plain; charset=utf-8")
+
+    def one_chunk(self, inbox, name, length, total, upload_id, offset):
+        """Append one piece of a file being sent in parts.
+
+        The editor uploads from a connection doing about 80 KB/s, where a single
+        request for a real scene runs for an hour and dies partway. Each piece is its
+        own short request, so a drop costs one piece rather than the whole file.
+        """
+        if not upload_id:
+            return self.send(HTTPStatus.BAD_REQUEST, "Missing upload id.",
+                             "text/plain; charset=utf-8")
+        target = part_path(inbox, upload_id, name)
+        have = target.stat().st_size if target.exists() else 0
+        if offset != have:
+            # The client and the server disagree about progress, so tell it the truth
+            # and let it carry on from there instead of corrupting the file.
+            return self.send(HTTPStatus.CONFLICT, json.dumps({"received": have}),
+                             "application/json; charset=utf-8")
+        if have + length > total:
+            return self.send(HTTPStatus.BAD_REQUEST, "Chunk runs past the end of the file.",
+                             "text/plain; charset=utf-8")
+        try:
+            with target.open("ab") as fh:
+                written = self.read_into(fh, length)
+        except OSError as exc:
+            return self.send(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc),
+                             "text/plain; charset=utf-8")
+        have += written
+        if have < total:
+            return self.send(HTTPStatus.OK, json.dumps({"received": have}),
+                             "application/json; charset=utf-8")
+        landed = self.land(target, inbox, name)
+        return self.send(HTTPStatus.OK, json.dumps({"received": have, "done": landed.name}),
+                         "application/json; charset=utf-8")
+
+    def land(self, staging, inbox, name):
+        """Move a finished upload into the queue under a name nothing else is using."""
+        final = inbox / name
+        stem, suffix = Path(name).stem, Path(name).suffix
+        count = 2
+        while final.exists():
+            final = inbox / f"{stem}-{count}{suffix}"
+            count += 1
+        staging.replace(final)
+        return final
 
 
 def serve(cfg, with_watcher=True):
@@ -422,6 +546,8 @@ def serve(cfg, with_watcher=True):
     if not cfg["EDITOR_PASSWORD"]:
         raise SystemExit("no EDITOR_PASSWORD set. Run: bin/renderdesk password")
     Handler.cfg, Handler.dirs = cfg, dirs
+
+    sweep_parts(dirs[0])
 
     if with_watcher:
         thread = threading.Thread(target=watch.loop, args=(cfg,), daemon=True)
