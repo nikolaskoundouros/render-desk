@@ -30,13 +30,16 @@ def _run(args, timeout=None):
 
 def listing(cfg):
     """Scene files sitting in the watched folder, newest first."""
-    out = _run(["lsjson", cfg["DRIVE_REMOTE"], "--files-only"], timeout=120)
+    # Recursive: editors put files in subfolders and a flat listing silently finds
+    # nothing, which looks exactly like an empty folder.
+    out = _run(["lsjson", cfg["DRIVE_REMOTE"], "--files-only", "-R"], timeout=300)
     files = []
     for item in json.loads(out or "[]"):
-        name = item.get("Name", "")
-        if Path(name).suffix.lower() in watch.ACCEPTS:
-            files.append({"name": name, "size": item.get("Size", 0),
-                          "id": item.get("ID", name), "modified": item.get("ModTime", "")})
+        where = item.get("Path") or item.get("Name", "")
+        if Path(where).suffix.lower() in watch.ACCEPTS:
+            files.append({"name": Path(where).name, "path": where,
+                          "size": item.get("Size", 0),
+                          "id": item.get("ID", where), "modified": item.get("ModTime", "")})
     files.sort(key=lambda f: f["modified"])
     return files
 
@@ -79,7 +82,7 @@ def fetch_new(cfg, log=print):
         staging = inbox / f".drive-{item['name']}"
         started = time.time()
         log(f"RD_DRIVE fetching {item['name']} ({item['size'] / 1048576:.0f} MB)")
-        _run(["copyto", f"{cfg['DRIVE_REMOTE']}/{item['name']}", str(staging),
+        _run(["copyto", f"{cfg['DRIVE_REMOTE']}/{item['path']}", str(staging),
               "--transfers", "8", "--drive-chunk-size", "64M", "--retries", "3"],
              timeout=7200)
         took = max(time.time() - started, 0.1)
