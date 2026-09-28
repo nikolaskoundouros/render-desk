@@ -13,23 +13,35 @@ def main(out_path):
     scene = bpy.context.scene
     render = scene.render
 
-    # A linked library that nothing actually uses is a leftover, not a problem. The
-    # scene renders fine without it, so blocking on one would refuse a good file.
-    missing, stale = [], []
+    # Only two things can actually break a render by being absent: a linked library
+    # the scene still uses, and an image that is neither packed nor on disk.
+    #
+    # blend_paths() reports far more than that. Appending data from another .blend
+    # leaves its path behind on local datablocks, and those paths are residue: the
+    # data is already in the file. Blocking on them refuses a perfectly good scene,
+    # which is exactly what happened to a file with 2195 objects and no libraries
+    # at all.
+    missing, stale, residue = [], [], []
     libraries = {}
     for lib in bpy.data.libraries:
         target = bpy.path.abspath(lib.filepath)
-        users = getattr(lib, "users_id", None)
-        count = len(users) if users is not None else -1
-        libraries[lib.filepath] = count
+        libraries[lib.filepath] = lib.users
         if target and not os.path.exists(target):
-            (missing if count != 0 else stale).append(lib.filepath)
+            (missing if lib.users else stale).append(lib.filepath)
 
-    for path in bpy.utils.blend_paths(absolute=True, packed=False, local=False):
-        if not path or path in libraries:
+    for image in bpy.data.images:
+        if image.packed_file or not image.filepath or image.source == "GENERATED":
             continue
-        if not os.path.exists(bpy.path.abspath(path)):
-            missing.append(path)
+        if not image.users:
+            continue
+        target = bpy.path.abspath(image.filepath)
+        if target and not os.path.exists(target):
+            missing.append(image.filepath)
+
+    known = set(missing) | set(stale)
+    for path in bpy.utils.blend_paths(absolute=False, packed=False, local=False):
+        if path and path not in known and not os.path.exists(bpy.path.abspath(path)):
+            residue.append(path)
 
     report = {
         "blender_running": list(bpy.app.version),
@@ -47,6 +59,7 @@ def main(out_path):
         "resolution_percentage": render.resolution_percentage,
         "missing_files": sorted(set(missing)),
         "stale_links": sorted(set(stale)),
+        "residue_paths": sorted(set(residue)),
         "libraries": {k: v for k, v in sorted(libraries.items())},
         "objects": len(scene.objects),
         "packed_images": sum(1 for i in bpy.data.images if i.packed_file),

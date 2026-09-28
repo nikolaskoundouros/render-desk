@@ -143,10 +143,12 @@ class Job:
     def accept_scene(self, report):
         """Gate a scene report, wherever it was produced, and tell the editor what
         is about to be rendered."""
+        # Save the report before gating. A rejection is exactly when the details
+        # matter most, and writing it afterwards threw them away.
+        (self.dir / "scene-report.json").write_text(json.dumps(report, indent=2))
         preflight.gate(report)
         self.report = report
         self.opts["fps"] = report["fps"]
-        (self.dir / "scene-report.json").write_text(json.dumps(report, indent=2))
         width, height = report["resolution"]
         if self.opts["scale"]:
             width, height = width * self.opts["scale"] // 100, height * self.opts["scale"] // 100
