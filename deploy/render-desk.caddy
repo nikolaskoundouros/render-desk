@@ -22,15 +22,19 @@ HOSTNAME {
 		Referrer-Policy "no-referrer"
 		X-Robots-Tag "noindex, nofollow"
 	}
-	# Scene files are large and renders are long: no buffering, no early timeout.
 	request_body {
 		max_size 4GB
 	}
 	reverse_proxy 127.0.0.1:8630 {
 		flush_interval -1
+		# No timeouts here on purpose. A 30m write_timeout was killing the editor's
+		# uploads at exactly 1800 seconds with a 502: a 300 MB scene on his line
+		# takes 57 minutes, so it could never finish. Caddy's default is no limit,
+		# which is what a file upload of unknown size and an hours-long render both
+		# need. The size cap above is the real guard.
 		transport http {
-			read_timeout 30m
-			write_timeout 30m
+			read_timeout 0
+			write_timeout 0
 		}
 	}
 }

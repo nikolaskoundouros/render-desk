@@ -52,6 +52,18 @@ def valid(cfg, token):
         return False
 
 
+CHUNK_BYTES = 4 * 1024 * 1024
+_part_locks = {}
+_locks_guard = threading.Lock()
+
+
+def part_lock(key):
+    """One lock per upload, so parallel chunks of the same file update its record
+    safely while chunks of different files never wait on each other."""
+    with _locks_guard:
+        return _part_locks.setdefault(key, threading.Lock())
+
+
 def part_path(inbox, upload_id, name):
     """Where a partial upload accumulates.
 
@@ -63,14 +75,37 @@ def part_path(inbox, upload_id, name):
     return inbox / f".part-{digest}"
 
 
+def read_record(path):
+    try:
+        return json.loads(path.read_text())
+    except (OSError, ValueError):
+        return {}
+
+
+def write_record(path, state):
+    path.write_text(json.dumps(state))
+
+
+def received_bytes(state):
+    """Bytes safely on disk. The last chunk is short, so it is measured against the
+    total rather than assumed to be full length."""
+    total = state.get("total", 0)
+    got = 0
+    for index in state.get("done", []):
+        start = index * CHUNK_BYTES
+        got += min(CHUNK_BYTES, max(0, total - start))
+    return got
+
+
 def sweep_parts(inbox, older_than_hours=24):
     """Abandoned uploads are rubbish after a day. Without this they accumulate
     silently until the disk is full."""
     cutoff = time.time() - older_than_hours * 3600
-    for path in inbox.glob(".part-*"):
+    for path in list(inbox.glob(".part-*")):
         try:
             if path.stat().st_mtime < cutoff:
                 path.unlink()
+                path.with_suffix(".record").unlink(missing_ok=True)
         except OSError:
             pass
 
@@ -200,6 +235,7 @@ drop.addEventListener('drop', ev => ev.dataTransfer.files[0] && upload(ev.dataTr
 
 const MAXMB = parseInt(document.getElementById('limit').dataset.mb, 10);
 const CHUNK = 4 * 1024 * 1024;
+const LANES = 4;   // chunks in flight at once: latency, not bandwidth, is the limit
 const uploadId = f => `${f.name}|${f.size}|${f.lastModified}`
   .replace(/[^A-Za-z0-9|._-]/g, '_');
 
@@ -211,56 +247,71 @@ async function upload(f) {
     return;
   }
   const id = uploadId(f), q = `id=${encodeURIComponent(id)}&name=${encodeURIComponent(f.name)}`;
+  const chunks = Math.ceil(f.size / CHUNK);
   barwrap.hidden = false;
   drop.style.pointerEvents = 'none';
 
-  // Ask the server how much of this exact file it already has, so a dropped
-  // connection costs one chunk rather than the whole upload.
-  let sent = 0;
+  // Ask which pieces the server already has, so a dropped connection costs one
+  // piece rather than the whole upload and choosing the file again carries on.
+  let have = new Set();
   try {
     const r = await fetch(`/upload/status?${q}`);
-    if (r.ok) sent = (await r.json()).received || 0;
-  } catch (e) { /* start from zero */ }
-  if (sent) note.textContent = 'Carrying on from ' + Math.round(sent / 1048576) + ' MB...';
+    if (r.ok) (await r.json()).done.forEach(i => have.add(i));
+  } catch (e) { /* start from nothing */ }
+  const started = Date.now(), already = have.size;
+  if (already) note.textContent = 'Carrying on from ' + Math.round(already * CHUNK / 1048576) + ' MB...';
 
   const show = () => {
-    bar.style.width = (sent / f.size * 100) + '%';
-    note.textContent = `Uploading ${f.name}: ${Math.round(sent / 1048576)}`
-      + ` of ${Math.round(f.size / 1048576)} MB`;
+    const doneMB = have.size * CHUNK / 1048576, totalMB = f.size / 1048576;
+    bar.style.width = Math.min(100, have.size / chunks * 100) + '%';
+    const secs = (Date.now() - started) / 1000;
+    const rate = (have.size - already) * CHUNK / 1048576 / Math.max(secs, 1);
+    const left = rate > 0.01 ? `, about ${Math.max(1, Math.round((chunks - have.size) * CHUNK
+      / 1048576 / rate / 60))} min left` : '';
+    note.textContent = `Uploading ${f.name}: ${Math.round(Math.min(doneMB, totalMB))}`
+      + ` of ${Math.round(totalMB)} MB${left}`;
   };
   show();
 
-  let failures = 0;
-  while (sent < f.size) {
-    const end = Math.min(sent + CHUNK, f.size);
-    try {
-      const res = await fetch(`/upload?${q}&offset=${sent}&total=${f.size}`,
-                              {method: 'PUT', body: f.slice(sent, end)});
-      if (res.status === 409) { sent = (await res.json()).received || 0; show(); continue; }
-      if (!res.ok) throw new Error(await res.text());
-      const out = await res.json();
-      sent = out.received;
-      failures = 0;
-      show();
-      if (out.done) {
-        barwrap.hidden = true; bar.style.width = '0'; drop.style.pointerEvents = '';
-        note.textContent = f.name + ' received. It appears below within a minute.';
-        refresh();
-        return;
+  const queue = [];
+  for (let i = 0; i < chunks; i++) if (!have.has(i)) queue.push(i);
+  let failed = false, finishedName = null;
+
+  async function lane() {
+    while (queue.length && !failed) {
+      const i = queue.shift();
+      const start = i * CHUNK, end = Math.min(start + CHUNK, f.size);
+      let tries = 0;
+      while (true) {
+        try {
+          const res = await fetch(`/upload?${q}&offset=${start}&total=${f.size}`,
+                                  {method: 'PUT', body: f.slice(start, end)});
+          if (!res.ok) throw new Error(await res.text());
+          const out = await res.json();
+          if (out.done) finishedName = out.done;
+          have.add(i); show();
+          break;
+        } catch (e) {
+          tries += 1;
+          if (tries > 6) { failed = true; queue.unshift(i); return; }
+          note.textContent = `Connection dropped, retrying piece ${i + 1} of ${chunks}`
+            + ` (${tries} of 6)...`;
+          await new Promise(r => setTimeout(r, 1500 * tries));
+        }
       }
-    } catch (e) {
-      failures += 1;
-      if (failures > 8) {
-        drop.style.pointerEvents = '';
-        note.textContent = 'Upload keeps dropping. Your progress is saved, so choose the'
-          + ' same file again and it carries on from ' + Math.round(sent / 1048576) + ' MB.';
-        return;
-      }
-      note.textContent = `Connection dropped at ${Math.round(sent / 1048576)} MB,`
-        + ` trying again (${failures} of 8)...`;
-      await new Promise(r => setTimeout(r, 2000 * failures));
     }
   }
+
+  await Promise.all(Array.from({length: Math.min(LANES, chunks)}, lane));
+  drop.style.pointerEvents = '';
+  barwrap.hidden = true; bar.style.width = '0';
+  if (failed) {
+    note.textContent = 'Upload keeps dropping. Your progress is saved, so choose the same'
+      + ' file again and it carries on from ' + Math.round(have.size * CHUNK / 1048576) + ' MB.';
+    return;
+  }
+  note.textContent = f.name + ' received. It appears below within a minute.';
+  refresh();
 }
 
 const esc = s => s.replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
@@ -377,9 +428,12 @@ class Handler(BaseHTTPRequestHandler):
             query = urllib.parse.parse_qs(urllib.parse.urlparse(self.path).query)
             target = part_path(self.dirs[0], query.get("id", [""])[0],
                                safe_name(query.get("name", [""])[0]))
-            have = target.stat().st_size if target.exists() else 0
-            return self.send(HTTPStatus.OK, json.dumps({"received": have}),
-                             "application/json; charset=utf-8")
+            state = read_record(target.with_suffix(".record"))
+            return self.send(HTTPStatus.OK, json.dumps({
+                "received": received_bytes(state),
+                "done": sorted(state.get("done", [])),
+                "chunk": CHUNK_BYTES,
+            }), "application/json; charset=utf-8")
         if path == "/api/state":
             return self.send(HTTPStatus.OK, json.dumps(collect(self.dirs)),
                              "application/json; charset=utf-8")
@@ -469,6 +523,14 @@ class Handler(BaseHTTPRequestHandler):
                               query.get("id", [""])[0],
                               int(query.get("offset", ["0"])[0] or 0))
 
+    def drain(self, length, cap=8 << 20):
+        left = min(length, cap)
+        while left > 0:
+            chunk = self.rfile.read(min(1 << 20, left))
+            if not chunk:
+                return
+            left -= len(chunk)
+
     def read_into(self, handle, length):
         written = 0
         while written < length:
@@ -496,37 +558,69 @@ class Handler(BaseHTTPRequestHandler):
         return self.send(HTTPStatus.OK, "ok", "text/plain; charset=utf-8")
 
     def one_chunk(self, inbox, name, length, total, upload_id, offset):
-        """Append one piece of a file being sent in parts.
+        """Write one piece of a file at its own offset.
 
-        The editor uploads from a connection doing about 80 KB/s, where a single
-        request for a real scene runs for an hour and dies partway. Each piece is its
-        own short request, so a drop costs one piece rather than the whole file.
+        Pieces may arrive in any order and several at once. That is the point: the
+        editor uploads from India to Helsinki, where one stream at a time is limited
+        by round-trip latency rather than by his line, so several in flight go
+        several times faster. Each piece is also short enough that a drop costs one
+        piece instead of the upload.
         """
         if not upload_id:
             return self.send(HTTPStatus.BAD_REQUEST, "Missing upload id.",
                              "text/plain; charset=utf-8")
+        # A piece must be exactly the size its position implies. Without this a short
+        # write at a valid offset marks the whole 4 MB piece complete and the assembled
+        # file is quietly corrupt.
+        expected = min(CHUNK_BYTES, total - offset) if offset < total else -1
+        if offset < 0 or offset % CHUNK_BYTES or length != expected:
+            # Read the body away before answering. A chunk is at most 4 MB, and
+            # closing on the client mid-send turns a clear refusal into a network
+            # error it cannot report.
+            self.drain(length)
+            return self.send(HTTPStatus.BAD_REQUEST,
+                             "Chunk is not the right size for its position.",
+                             "text/plain; charset=utf-8")
+
         target = part_path(inbox, upload_id, name)
-        have = target.stat().st_size if target.exists() else 0
-        if offset != have:
-            # The client and the server disagree about progress, so tell it the truth
-            # and let it carry on from there instead of corrupting the file.
-            return self.send(HTTPStatus.CONFLICT, json.dumps({"received": have}),
-                             "application/json; charset=utf-8")
-        if have + length > total:
-            return self.send(HTTPStatus.BAD_REQUEST, "Chunk runs past the end of the file.",
+        record = target.with_suffix(".record")
+        lock = part_lock(target.name)
+
+        with lock:
+            state = read_record(record)
+            if state.get("total") != total:
+                # A different file reusing the id, or a changed file: start again.
+                state = {"total": total, "done": []}
+                with target.open("wb") as fh:
+                    fh.truncate(total)
+                write_record(record, state)
+
+        body = self.rfile.read(length)
+        if len(body) != length:
+            return self.send(HTTPStatus.BAD_REQUEST, "Chunk arrived incomplete.",
                              "text/plain; charset=utf-8")
-        try:
-            with target.open("ab") as fh:
-                written = self.read_into(fh, length)
-        except OSError as exc:
-            return self.send(HTTPStatus.INTERNAL_SERVER_ERROR, str(exc),
-                             "text/plain; charset=utf-8")
-        have += written
-        if have < total:
-            return self.send(HTTPStatus.OK, json.dumps({"received": have}),
+        with target.open("r+b") as fh:
+            fh.seek(offset)
+            fh.write(body)
+
+        with lock:
+            state = read_record(record)
+            index = offset // CHUNK_BYTES
+            if index not in state["done"]:
+                state["done"].append(index)
+            write_record(record, state)
+            complete = received_bytes(state) >= total
+
+        if not complete:
+            return self.send(HTTPStatus.OK, json.dumps({"received": received_bytes(state)}),
                              "application/json; charset=utf-8")
-        landed = self.land(target, inbox, name)
-        return self.send(HTTPStatus.OK, json.dumps({"received": have, "done": landed.name}),
+        with lock:
+            if not target.exists():      # another thread already landed it
+                return self.send(HTTPStatus.OK, json.dumps({"received": total, "done": name}),
+                                 "application/json; charset=utf-8")
+            landed = self.land(target, inbox, name)
+            record.unlink(missing_ok=True)
+        return self.send(HTTPStatus.OK, json.dumps({"received": total, "done": landed.name}),
                          "application/json; charset=utf-8")
 
     def land(self, staging, inbox, name):
