@@ -1,0 +1,295 @@
+"""Workbench: one GPU that stays on while Nick and Claude work, so previews and stills never run Blender on the 8 GB
+Mac (Nick, 2026-10-06: "yes set up the cloud gpu"). Same RunPod account, ssh key and Blender build as the desk, but
+its own pod name, so no desk job ever sweeps it. A watchdog destroys it after IDLE_MINUTES without a command or
+MAX_HOURS in all, even if the Mac session that started it is gone. Its cost goes in the desk ledger, so the daily and
+monthly caps count it.
+
+Files sync to the same absolute path on the pod (/Users/nick/Desktop/... exists there too), so scripts and .blend
+files that use absolute Mac paths work unchanged.
+"""
+import json
+import os
+import shlex
+import subprocess
+import sys
+import threading
+import time
+import datetime as dt
+from pathlib import Path
+
+from . import ledger, runpod_api
+from .providers.runpod import RunPodProvider, SCRIPTS
+
+PREFIX = "workbench-"
+IDLE_MINUTES = 10                                   # 2026-10-07: three sessions paid 30 idle minutes each
+MAX_HOURS = 5                                      # Nick, 2026-10-07: "i want the gpu for 5 hours max"
+EXCLUDE = [".git", "__pycache__", "*.blend1", "gpu/", "review/*_frames/", "review/_*", "*.mp4"]
+
+
+class _Pods(RunPodProvider):
+    def _pod_body(self, job_name, gpu_id, public, use_volume):
+        body = super()._pod_body(job_name, gpu_id, public, use_volume)
+        body["name"] = f"{PREFIX}{int(time.time())}"
+        body["disk"] = 80                                    # projects sync to the pod's own disk
+        return body
+
+
+def _state_path(cfg):
+    return Path(cfg["STATE_DIR"]) / "workbench.json"
+
+
+def _load(cfg):
+    p = _state_path(cfg)
+    if not p.exists():
+        return None
+    for _ in range(5):                                   # never let a half-written file kill the watchdog
+        try:
+            return json.loads(p.read_text())
+        except json.JSONDecodeError:
+            time.sleep(0.2)
+    return json.JSONDecoder().raw_decode(p.read_text())[0]
+
+
+def _save(cfg, st):
+    # atomic: several live sessions touch this file at once, and two plain writes once interleaved and broke the JSON,
+    # which crashed the watchdog (2026-10-07)
+    p = _state_path(cfg)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    tmp = p.with_name(f"{p.name}.{os.getpid()}.{threading.get_ident()}.tmp")
+    tmp.write_text(json.dumps(st, indent=1))
+    os.replace(tmp, p)
+
+
+def _touch(cfg):
+    import fcntl
+    lock = _state_path(cfg).with_suffix(".lock")
+    with open(lock, "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        st = _load(cfg)
+        if st:
+            st["last_used"] = time.time()
+            _save(cfg, st)
+    return st
+
+
+def _wb_left(cfg):
+    """What is left of today's workbench cap (the GPU time for building a clip, finals excluded)."""
+    since = dt.datetime.now().replace(hour=0, minute=0, second=0, microsecond=0); spent = 0.0
+    for row in ledger.rows(cfg):
+        try:
+            if row.get("job") == "workbench" and dt.datetime.fromisoformat(row["when"]) >= since: spent += float(row.get("cost_usd") or 0)
+        except (ValueError, KeyError):
+            continue
+    return float(cfg.get("WORKBENCH_DAY_CAP_USD", 6)) - spent
+
+
+def _caps_left(cfg):
+    now = dt.datetime.now()
+    day = ledger.spent_since(cfg, now.replace(hour=0, minute=0, second=0, microsecond=0))
+    month = ledger.spent_since(cfg, now.replace(day=1, hour=0, minute=0, second=0, microsecond=0))
+    return float(cfg["DAILY_SPEND_CAP_USD"]) - day, float(cfg["MONTHLY_SPEND_CAP_USD"]) - month
+
+
+def _ssh(pods, st, command, capture=False):
+    target = tuple(st["target"])
+    env = f"export BLENDER={shlex.quote(st['blender'])}; "
+    if capture:
+        return subprocess.run(pods._ssh_base(target) + [env + command], capture_output=True, text=True)
+    return subprocess.run(pods._ssh_base(target) + [env + command]).returncode
+
+
+def _rsync(pods, st, src, dst, up=True, excludes=()):
+    host, port, user = st["target"]
+    ssh = f"ssh -i {shlex.quote(str(pods.key))} -p {port} -o StrictHostKeyChecking=accept-new -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR"
+    args = ["rsync", "-az", "-e", ssh] + [f"--exclude={e}" for e in excludes]
+    pair = [src, f"{user}@{host}:{dst}"] if up else [f"{user}@{host}:{src}", dst]
+    return subprocess.run(args + pair).returncode
+
+
+def up(cfg, log=print):
+    pods = _Pods(cfg)
+    st = _load(cfg)
+    if st:
+        try:
+            pod = pods.client.get_pod(st["pod_id"])
+            if pod.get("status") == "RUNNING":
+                log(f"WB already up: pod {st['pod_id']} {st['gpu']} ${st['rate']:.2f}/hr, "
+                    f"up {(time.time() - st['started']) / 3600:.1f} h")
+                _touch(cfg)
+                return 0
+        except runpod_api.RunPodError:
+            pass
+        _close(cfg, st, "found dead", log)
+    day, month = _caps_left(cfg)
+    if day < 1 or month < 1:
+        log(f"WB refused: spend cap reached (today ${day:.2f} left, this month ${month:.2f} left). Nick raises caps in render.env.")
+        return 2
+    if _wb_left(cfg) < 0.5:
+        log(f"WB refused: today's workbench cap is used (${float(cfg.get('WORKBENCH_DAY_CAP_USD', 6)):.2f}). Nick raises WORKBENCH_DAY_CAP_USD in render.env.")
+        return 2
+    pod, _ = pods._create("workbench", log)
+    started = time.time()
+    rate = float(pod.get("cost") or 0)
+    st = {"pod_id": pod["id"], "gpu": (pod.get("gpu") or {}).get("id", "?"), "rate": rate,
+          "started": started, "last_used": started, "target": None,
+          "blender": f"/workspace/blender/{cfg['BLENDER_VERSION']}/blender"}
+    _save(cfg, st)
+    _spawn_watchdog(cfg)                                     # from here on the pod can never outlive its limits
+    try:
+        pod, target = pods._wait_ready(pod["id"], log)
+        st["target"] = list(target)
+        st["rate"] = float(pod.get("cost") or rate)
+        _save(cfg, st)
+        if os.environ.get("WB_NO_BLENDER"):                  # browser-canvas films need no Blender (2026-10-13)
+            boot = ("mkdir -p /workspace && (command -v rsync >/dev/null && command -v ffmpeg >/dev/null || "
+                    "(apt-get update -qq && DEBIAN_FRONTEND=noninteractive apt-get install -y -qq rsync ffmpeg >/dev/null))")
+        else:
+            pods._copy(target, SCRIPTS / "pod_bootstrap.sh", "/root/pod_bootstrap.sh")
+            boot = f"mkdir -p /workspace && bash /root/pod_bootstrap.sh {shlex.quote(cfg['BLENDER_VERSION'])}"
+        if _ssh(pods, st, boot) != 0:
+            raise RuntimeError("bootstrap failed")
+    except Exception as exc:
+        log(f"WB setup failed: {exc}")
+        _close(cfg, _load(cfg), "setup failed", log)
+        return 1
+    _touch(cfg)
+    log(f"WB up: pod {st['pod_id']} {st['gpu']} ${st['rate']:.2f}/hr; idle stop {IDLE_MINUTES} min, hard stop {MAX_HOURS} h")
+    return 0
+
+
+def _need(cfg, log):
+    st = _touch(cfg)
+    if not st or not st.get("target"):
+        log("WB not up: run bin/workbench up")
+        return None
+    return st
+
+
+def run(cfg, command, log=print):
+    st = _need(cfg, log)
+    if not st:
+        return 2
+    from renderdesk import clipgate_check            # Nick, 2026-10-16: no preview or final render past the clip gate
+    why = clipgate_check.refusal(command)
+    if why:
+        log("WB refused (clip gate): " + why)
+        return 3
+    for b in clipgate_check.cleared_blends(command):   # the pod renders exactly the files that passed
+        push(cfg, b, log)
+    _touch(cfg)
+    done = threading.Event()
+    def keepalive():                                   # a long command is use, not idleness (a 30+ min build was killed)
+        while not done.wait(300):
+            _touch(cfg)
+    threading.Thread(target=keepalive, daemon=True).start()
+    try:
+        rc = _ssh(_Pods(cfg), st, command)
+    finally:
+        done.set()
+    _touch(cfg)
+    return rc
+
+
+def push(cfg, local, log=print):
+    st = _need(cfg, log)
+    if not st:
+        return 2
+    local = os.path.abspath(os.path.expanduser(local))     # not resolve(): /tmp must stay /tmp on the pod
+    pods = _Pods(cfg)
+    if Path(local).is_dir():
+        _ssh(pods, st, f"mkdir -p {shlex.quote(local)}")
+        rc = _rsync(pods, st, local + "/", local + "/", up=True, excludes=EXCLUDE)
+    else:
+        _ssh(pods, st, f"mkdir -p {shlex.quote(str(Path(local).parent))}")
+        rc = _rsync(pods, st, local, local, up=True)
+    _touch(cfg)
+    return rc
+
+
+def pull(cfg, remote, local, log=print):
+    st = _need(cfg, log)
+    if not st:
+        return 2
+    Path(local).expanduser().mkdir(parents=True, exist_ok=True) if remote.endswith("/") else None
+    rc = _rsync(_Pods(cfg), st, remote, str(Path(local).expanduser()) + ("/" if remote.endswith("/") else ""), up=False)
+    _touch(cfg)
+    return rc
+
+
+def status(cfg, log=print):
+    st = _load(cfg)
+    if not st:
+        log("WB down")
+        return 1
+    up_h = (time.time() - st["started"]) / 3600
+    idle = (time.time() - st["last_used"]) / 60
+    log(f"WB up: pod {st['pod_id']} {st['gpu']}, {up_h:.2f} h so far (${up_h * st['rate']:.2f}), idle {idle:.0f} min")
+    return 0
+
+
+def _close(cfg, st, why, log=print):
+    if not st:
+        return
+    pods = _Pods(cfg)
+    for attempt in range(5):
+        try:
+            pods.client.terminate_pod(st["pod_id"])
+            break
+        except runpod_api.RunPodError as exc:
+            if "404" in str(exc) or "not found" in str(exc).lower():
+                break
+            log(f"WB terminate attempt {attempt + 1} failed: {exc}")
+            time.sleep(5)
+    else:
+        log(f"WB_ALERT could not terminate pod {st['pod_id']}, stop it in the RunPod console")
+        return
+    secs = time.time() - st["started"]
+    cost = round(st["rate"] * secs / 3600, 4)
+    ledger.append(cfg, {"when": dt.datetime.now().isoformat(timespec="seconds"), "job": "workbench", "provider": "runpod",
+                        "gpu": st.get("gpu", "?"), "data_centre": "", "frames": 0, "seconds": round(secs, 1),
+                        "render_seconds": 0, "seconds_per_frame": 0, "usd_per_hour": st["rate"], "cost_usd": cost,
+                        "quality": f"workbench ({why})"})
+    _state_path(cfg).unlink(missing_ok=True)
+    log(f"WB down ({why}): {secs / 3600:.2f} h, ${cost:.2f}")
+
+
+def down(cfg, log=print):
+    st = _load(cfg)
+    if not st:
+        log("WB already down")
+        return 0
+    _close(cfg, st, "stopped", log)
+    return 0
+
+
+def _spawn_watchdog(cfg):
+    log = Path(cfg["STATE_DIR"]) / "workbench-watchdog.log"
+    with open(log, "a") as fh:
+        subprocess.Popen([sys.executable, str(Path(__file__).resolve().parent.parent / "bin" / "workbench"), "_watchdog"],
+                         stdout=fh, stderr=fh, start_new_session=True)
+
+
+def watchdog(cfg):
+    say = lambda m: print(f"{dt.datetime.now().isoformat(timespec='seconds')} {m}", flush=True)
+    say("watchdog started")
+    while True:
+        time.sleep(60)
+        st = _load(cfg)
+        if not st:
+            say("no workbench, exiting")
+            return 0
+        now = time.time()
+        if now - st["last_used"] > IDLE_MINUTES * 60:
+            _close(cfg, st, f"idle {IDLE_MINUTES} min", say)
+            return 0
+        if now - st["started"] > MAX_HOURS * 3600:
+            _close(cfg, st, f"hard stop {MAX_HOURS} h", say)
+            return 0
+        day, month = _caps_left(cfg)
+        running = st["rate"] * (now - st["started"]) / 3600
+        if day - running < 0 or month - running < 0:
+            _close(cfg, st, "spend cap", say)
+            return 0
+        if _wb_left(cfg) - running < 0:
+            _close(cfg, st, "workbench day cap", say)
+            return 0

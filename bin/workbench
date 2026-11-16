@@ -1,0 +1,42 @@
+#!/usr/bin/env python3
+"""workbench: an always-on GPU for previews and stills (see renderdesk/workbench.py).
+  workbench up                 rent it (stops itself after 30 idle minutes or 10 hours)
+  workbench status             is it up, for how long, what it has cost
+  workbench push DIR_OR_FILE   copy to the same absolute path on the pod
+  workbench run 'COMMAND'      run there ($BLENDER is set)
+  workbench pull REMOTE LOCAL  copy back
+  workbench down               destroy it now and log its cost
+"""
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from renderdesk import config, workbench as wb  # noqa: E402
+
+
+def main():
+    if len(sys.argv) < 2 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__)
+        return 0
+    cfg = config.load()
+    cmd, rest = sys.argv[1], sys.argv[2:]
+    if cmd == "up":
+        return wb.up(cfg)
+    if cmd == "status":
+        return wb.status(cfg)
+    if cmd == "down":
+        return wb.down(cfg)
+    if cmd == "run" and rest:
+        return wb.run(cfg, " ".join(rest))
+    if cmd == "push" and rest:
+        return max(wb.push(cfg, p) for p in rest)
+    if cmd == "pull" and len(rest) == 2:
+        return wb.pull(cfg, rest[0], rest[1])
+    if cmd == "_watchdog":
+        return wb.watchdog(cfg)
+    print(__doc__)
+    return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

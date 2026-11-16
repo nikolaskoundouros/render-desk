@@ -8,6 +8,7 @@ The three rules this file exists to keep:
      the whole reason this exists.
 """
 import json
+import re
 import shlex
 import subprocess
 import time
@@ -17,6 +18,12 @@ from .. import preflight, runpod_api
 
 SCRIPTS = Path(__file__).resolve().parent.parent / "scripts"
 POD_PREFIX = "renderdesk-"
+
+
+def pod_born(name):
+    """When a pod was rented, from the -t<epoch> tag this code puts at the end of its name."""
+    m = re.search(r"-t(\d{10})$", name)
+    return int(m.group(1)) if m else None
 
 
 class RunPodProvider:
@@ -73,20 +80,31 @@ class RunPodProvider:
     # --- pod lifecycle -------------------------------------------------------
     def sweep_orphans(self, log=print):
         """Kill anything this desk left behind. Cheap insurance against a pod
-        quietly billing all night because a previous run was killed."""
+        quietly billing all night because a previous run was killed.
+
+        A pod counts as left behind only once it is older than the longest a job may
+        run (MAX_JOB_MINUTES) plus an hour: its birth time is tagged into its name.
+        Younger pods belong to jobs still rendering, here or on the box, so several
+        jobs can run side by side (Nick, 2026-10-06: parallel jobs). Untagged desk pods
+        come from code older than the tag and are swept as before."""
         killed = []
+        max_age = (float(self.cfg.get("MAX_JOB_MINUTES") or 120) + 60) * 60
         for pod in self.client.list_pods():
             name = pod.get("name", "")
-            if name.startswith(POD_PREFIX) and pod.get("status") not in ("TERMINATED", "EXITED"):
-                self.client.terminate_pod(pod["id"])
-                killed.append(name)
+            if not name.startswith(POD_PREFIX) or pod.get("status") in ("TERMINATED", "EXITED"):
+                continue
+            born = pod_born(name)
+            if born is not None and time.time() - born < max_age:
+                continue
+            self.client.terminate_pod(pod["id"])
+            killed.append(name)
         if killed:
             log(f"RD_SWEEP terminated leftover pods: {', '.join(killed)}")
         return killed
 
     def _pod_body(self, job_name, gpu_id, public, use_volume):
         body = {
-            "name": f"{POD_PREFIX}{job_name}"[:191],
+            "name": f"{POD_PREFIX}{job_name[:160]}-t{int(time.time())}",   # birth time: see sweep_orphans
             "image": self.cfg["RUNPOD_IMAGE"],
             "gpu": {"id": gpu_id, "count": 1},
             "cloud": "SECURE",

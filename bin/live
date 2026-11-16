@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""live: one Blender kept open on the workbench, changes sent to it as small jobs (scripts/bserve.py).
+  live start BLEND JOBS_DIR           open BLEND there once and keep it open
+  live do JOBS_DIR JOB.py [PULL ...]  run JOB.py in that session, print its log, pull the listed dirs back
+                                     (needs LIVE_ISSUE; new stills in the pulled dirs go to Nick's Telegram)
+  live log JOBS_DIR                   the session's own log
+  live stop JOBS_DIR                  close the session
+Paths are the same absolute paths on both machines (the workbench mirrors them).
+"""
+import os, shlex, shutil, sys, threading, time
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+from renderdesk import config, livegate, workbench as wb  # noqa: E402
+
+SERVE = str(Path(__file__).resolve().parent.parent / "scripts" / "bserve.py")
+MAX_LIVE = 3                                          # Blender sessions per GPU, both clips together
+
+
+def remote(cfg, st, command, capture=True):
+    r = wb._ssh(wb._Pods(cfg), st, command, capture=capture)
+    wb._touch(cfg)
+    return r
+
+
+def main():
+    if len(sys.argv) < 3 or sys.argv[1] in ("-h", "--help"):
+        print(__doc__); return 0
+    cfg = config.load(); st = wb._need(cfg, print)
+    if not st:
+        return 2
+    cmd = sys.argv[1]; jobs = os.path.abspath(sys.argv[3] if cmd == "start" else sys.argv[2])
+    q = shlex.quote
+    if cmd == "start":
+        blend = os.path.abspath(sys.argv[2]); os.makedirs(jobs, exist_ok=True)
+        # 2026-10-08: 3 of 4 preview renders died out of GPU memory with 7 Blender sessions on one 4090 (two clips)
+        n = remote(cfg, st, "pgrep -fc -- '-b .*--python .*[b]serve.py' || true").stdout.strip()
+        if n.isdigit() and int(n) >= MAX_LIVE:
+            print(f"LIVE REFUSED: {n} Blender sessions are already open on this GPU (max {MAX_LIVE}; with 7 it ran out of memory "
+                  f"on 2026-10-08). Reuse one that is open, or close one first: bin/live stop JOBS_DIR."); return 3
+        wb.push(cfg, SERVE, print)
+        remote(cfg, st, f"mkdir -p {q(jobs)} && rm -f {q(jobs)}/STOP {q(jobs)}/READY && cd {q(str(Path(blend).parent.parent))} && "
+                        f"(setsid nohup $BLENDER -b {q(blend)} -noaudio --python {q(SERVE)} -- {q(jobs)} > {q(jobs)}.log 2>&1 < /dev/null &); exit 0")   # detached: ssh must not wait on it
+        t = time.time()
+        r = remote(cfg, st, f"for i in $(seq 1 600); do [ -f {q(jobs)}/READY ] && exit 0; sleep 0.5; done; exit 1")
+        print(f"LIVE {'ready' if r.returncode == 0 else 'NOT READY (see live log)'} in {time.time() - t:.0f}s: {blend}")
+        return r.returncode
+    if cmd == "do":
+        src = os.path.abspath(sys.argv[3]); pulls = [os.path.abspath(p).rstrip("/") + "/" for p in sys.argv[4:]]
+        from renderdesk import clipgate_check           # Nick, 2026-10-16: moving pictures only through the clip gate
+        if clipgate_check.is_render(open(src).read()):
+            print("LIVE REFUSED (clip gate): live jobs make stills; render moving pictures with workbench run and "
+                  "render_range.py, where the clip gate checks them"); return 3
+        issue = os.environ.get("LIVE_ISSUE", "")
+        why = livegate.check_attempt(cfg, jobs, issue)
+        if why:
+            print("LIVE REFUSED: " + why); return 3
+        before = livegate.snapshot(pulls)
+        n = len([f for f in os.listdir(jobs) if f.endswith(".py")]) + 1 if os.path.isdir(jobs) else 1
+        os.makedirs(jobs, exist_ok=True)
+        job = os.path.join(jobs, f"{n:04d}_{os.path.basename(src)}"); shutil.copy(src, job)
+        t = time.time(); wb.push(cfg, job, print)
+        done = threading.Event()
+        def keepalive():                              # a long job is use, not idleness (a 50-min render was killed as idle)
+            while not done.wait(240):
+                wb._touch(cfg)
+        threading.Thread(target=keepalive, daemon=True).start()
+        try:
+            r = remote(cfg, st, f"while [ ! -f {q(job)}.done ]; do sleep 0.3; done; cat {q(job)}.log")
+        finally:
+            done.set()
+        print(r.stdout.rstrip()); print(f"LIVE job {os.path.basename(job)} round trip {time.time() - t:.0f}s")
+        import re as _re                                    # nothing lives only on the GPU: every scene the job saved comes back
+        for saved in sorted(set(_re.findall(r"SAVED (/\S+\.blend)", r.stdout))):
+            os.makedirs(os.path.dirname(saved), exist_ok=True); wb.pull(cfg, saved, saved, print); print("LIVE pulled back", saved)
+        for p in pulls:
+            os.makedirs(p, exist_ok=True); wb.pull(cfg, p, p, print)
+        livegate.send_new(jobs, os.path.basename(job), issue.strip(), before, pulls)
+        return 0 if "[OK" in r.stdout else 1
+    if cmd == "log":
+        print(remote(cfg, st, f"tail -40 {q(jobs)}.log").stdout); return 0
+    if cmd == "stop":
+        remote(cfg, st, f"touch {q(jobs)}/STOP"); print("LIVE stopping"); return 0
+    print(__doc__); return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

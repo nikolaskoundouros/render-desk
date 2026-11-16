@@ -32,6 +32,7 @@ DEFAULTS = {
     "MAX_JOB_MINUTES": "120",
     "DAILY_SPEND_CAP_USD": "20",
     "MONTHLY_SPEND_CAP_USD": "40",
+    "WORKBENCH_DAY_CAP_USD": "6",                    # Nick, 2026-10-07: today was $9.59 of idle and rework; a clip day was $2-3.5
     "RUNPOD_API_KEY": "",
     "RUNPOD_VOLUME_ID": "",
     "RUNPOD_DATA_CENTER": "",

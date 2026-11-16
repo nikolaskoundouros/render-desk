@@ -12,21 +12,24 @@ mkdir -p "$VOL/bin" "$VOL/jobs" "$VOL/frames"
 # Blender runs headless but still links the X and GL client libraries. ffmpeg comes
 # from the same apt call: Ubuntu's mirrors are a CDN and finish in seconds, where
 # fetching a static build from a single host was taking 70 seconds of every job.
-if ! dpkg -s libxi6 >/dev/null 2>&1; then
+if ! dpkg -s libxi6 >/dev/null 2>&1 || ! command -v rsync >/dev/null 2>&1; then
   export DEBIAN_FRONTEND=noninteractive
   apt-get update -qq
   apt-get install -y -qq --no-install-recommends \
     libx11-6 libxi6 libxxf86vm1 libxfixes3 libxrender1 libxkbcommon0 libsm6 libgl1 \
-    xz-utils curl ffmpeg >/dev/null
+    xz-utils curl ffmpeg rsync >/dev/null
 fi
 
 if [ ! -x "$BLENDER_DIR/blender" ]; then
+  # Several pods can now share the volume at once (parallel jobs), so unpack beside the
+  # final folder and move it into place in one step: a half-unpacked Blender is never seen.
   echo "RD_SETUP downloading Blender $VERSION"
-  mkdir -p "$BLENDER_DIR"
   URL="https://download.blender.org/release/Blender$SERIES/blender-$VERSION-linux-x64.tar.xz"
-  curl -fsSL "$URL" -o /tmp/blender.tar.xz
-  tar -xJf /tmp/blender.tar.xz -C "$BLENDER_DIR" --strip-components=1
-  rm -f /tmp/blender.tar.xz
+  TMP="$BLENDER_DIR.part.$$"; mkdir -p "$TMP" "$(dirname "$BLENDER_DIR")"
+  curl -fsSL "$URL" -o "/tmp/blender.$$.tar.xz"
+  tar -xJf "/tmp/blender.$$.tar.xz" -C "$TMP" --strip-components=1
+  rm -f "/tmp/blender.$$.tar.xz"
+  if [ ! -x "$BLENDER_DIR/blender" ]; then rm -rf "$BLENDER_DIR"; mv "$TMP" "$BLENDER_DIR"; else rm -rf "$TMP"; fi
 fi
 
 # Prefer whatever apt just installed. The static build stays as a fallback for an
